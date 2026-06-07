@@ -18,7 +18,7 @@ tool catalog so each query surfaces just the relevant tools.
 
 - **Unified MCP endpoint** — one URL, many upstream servers behind auth.
 - **Semantic tool retrieval** — FAISS + sentence-transformers search.
-- **Admin lockdown** — `list_tools()` returns nothing for non-admin keys; they discover tools via Tool-RAG.
+- **In-band discovery** — non-admin keys see a single `find_tools` meta-tool via `list_tools()`; calling it runs semantic retrieval and returns matching tools + schemas. Works with any MCP client, no out-of-band config.
 - **Multi-transport** — stdio, SSE, Streamable HTTP upstreams.
 - **Per-key policies** — server + prefix filters per API key.
 - **Agent-friendly provisioning** — add a server from a URL or git repo with one command; an AI agent can follow the [playbook](#agent-playbook-add-a-server-from-a-url-or-repo) end-to-end.
@@ -29,13 +29,32 @@ tool catalog so each query surfaces just the relevant tools.
 ### Design notes & caveats
 
 - **The non-admin lockdown is what keeps context small.** `list_tools()` returns
-  `[]` for non-admin keys (`gateway/server.py:40-44`), so a client never loads
-  the full catalog — it must discover tools via `POST /tool-rag/retrieve`. `call_tool`
-  still works for any allowed tool, by name.
-- **Schemas are returned eagerly.** `retrieve` attaches each matched tool's full
-  `input_schema` in the same response — there is no separate "describe tool" call
-  (`tool_rag/router.py:76-93`). This favours **call reliability** (the exact schema
-  is in context when the model builds arguments) at some cost to context savings.
+  only the `find_tools` meta-tool for non-admin keys (`gateway/server.py`), so a
+  client never loads the full catalog. The agent discovers tools by *calling*
+  `find_tools` (in-band, MCP-native). `call_tool` then works for any allowed tool,
+  by name.
+- **Both discovery paths are policy-scoped.** `find_tools` and `POST
+  /tool-rag/retrieve` both read the caller's `AccessPolicy` and restrict results
+  to the key's granted servers + `tool_prefixes`. A body-supplied `allowed_servers`
+  can only *narrow* within the grant, never broaden it. Enforcement is skipped
+  only when `TOOL_RAG_WITHOUT_AUTH=1` (no policy in context by design).
+- **Why a meta-tool, not just the HTTP route.** An MCP agent can only invoke MCP
+  *tools*; it cannot issue a raw `POST /tool-rag/retrieve` (only the host framework
+  can). `find_tools` is therefore the only discovery path a generic agent can
+  reach on its own. The gateway also sets the MCP `initialize` `instructions` field
+  telling the agent to call `find_tools` first.
+- **Callability caveat (strict clients).** `find_tools` returns a tool's
+  `call_name`, but that tool was never in `list_tools()`. This gateway's
+  `call_tool` executes any *allowed* tool regardless of listing, so it just works —
+  **provided the client lets the model emit a call to an unlisted name.** Clients
+  that validate calls against the advertised list would reject it; supporting them
+  cleanly needs `tools/list_changed` dynamics (see
+  [roadmap](#roadmap--future-considerations)).
+- **Schemas are returned eagerly.** Both `find_tools` and `/tool-rag/retrieve`
+  attach each matched tool's full `input_schema` in the same response — there is
+  no separate "describe tool" call (`tool_rag/router.py:76-93`). This favours
+  **call reliability** (the exact schema is in context when the model builds
+  arguments) at some cost to context savings.
 - **Context savings today = "catalog → top-K," not "names-only shortlist + lazy
   schema fetch."** Because each returned tool carries its full schema, a retrieve
   of many tools can still be heavy. The savings scale with **selectivity**:
@@ -288,6 +307,11 @@ Returns `query`, `results` (each with `tool_id`, `tool_name`, `server_name`,
 `score`, `reason`, `description`, `input_schema`, `status`, `tool_type`), and
 `fallback_used`.
 
+Results are scoped to the calling key's policy: the request's `allowed_servers`
+is intersected with the key's granted servers (it can only narrow, never
+broaden), and per-server `tool_prefixes` are applied. Scoping is skipped only
+under `TOOL_RAG_WITHOUT_AUTH=1`.
+
 #### `POST /tool-rag/reindex`
 
 Body `{"mode": "full"}` (rebuild) or `{"mode": "incremental"}` (dirty tools only).
@@ -334,10 +358,20 @@ Point an MCP server at `http://gateway:8765/mcp` with a **non-admin** token. The
 Deferred Tools flow discovers tools through `/tool-rag/retrieve` at runtime
 instead of loading the full catalog.
 
-### Generic clients
+### Generic MCP clients (in-band)
 
-Call `POST /tool-rag/retrieve` to get the top-K tools, pick one, then call it via
-`/mcp` using the merged `server_id__tool` name.
+Connect to `/mcp` with a **non-admin** token. `list_tools()` returns a single
+`find_tools` tool (and the `initialize` instructions explain it). The agent:
+
+1. Calls `find_tools` with `{"query": "<what you want to do>"}` (optional `top_k`).
+2. Reads the returned `results` — each has a `call_name`, `description`, and full
+   `input_schema`.
+3. Calls the chosen tool directly via `/mcp` using its `call_name`
+   (the merged `server_id__tool` name).
+
+No out-of-band knowledge of `/tool-rag/*` is required — discovery is fully in the
+MCP protocol. (Frameworks may still call `POST /tool-rag/retrieve` directly; it
+is policy-scoped to the caller's key the same way `find_tools` is.)
 
 ---
 
@@ -350,7 +384,7 @@ gateway/
   app.py                Starlette app + routes + lifespan sync
   auth.py               API key -> AccessPolicy
   backends.py           open_upstream_session() (fresh session per request)
-  server.py             merged MCP Server impl + policy enforcement
+  server.py             merged MCP Server impl + policy enforcement + find_tools meta-tool
   sync_adapter.py       pulls tool metadata from upstreams + reconciles removed servers
   health.py             upstream liveness probing (ServerHealth + background loop)
   tool_db.py            SQLite tool store (WAL)
@@ -377,9 +411,18 @@ config/
 
 ## Roadmap / future considerations
 
-**Two-phase (lazy) tool discovery.** Today `retrieve` returns full schemas
-eagerly (see [Design notes & caveats](#design-notes--caveats)). A lazy flow would
-compress context further at catalog scale:
+**Dynamic tool listing for strict clients.** `find_tools` makes discovery
+in-band, but the tools it surfaces are not in `list_tools()`, so clients that
+validate `tools/call` against the advertised list will reject them (see the
+callability caveat above). A future option: after `find_tools`, emit
+`notifications/tools/list_changed` and surface the discovered tools per session
+so strict clients re-fetch and accept the call. Harder here because upstream
+sessions are stateless/per-request — there is no per-connection tool set to
+mutate today.
+
+**Two-phase (lazy) tool discovery.** Today both `find_tools` and `retrieve`
+return full schemas eagerly (see [Design notes & caveats](#design-notes--caveats)).
+A lazy flow would compress context further at catalog scale:
 
 - **Optional schemas on `retrieve`** — e.g. `include_schema=false` to return a
   cheap names + description shortlist for discovery.
