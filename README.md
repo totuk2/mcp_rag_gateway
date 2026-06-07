@@ -1,9 +1,18 @@
+> ⚠️ **Research / experimental — beta.** This project is a homelab research
+> prototype, not production-hardened software. APIs, schemas, and behavior may
+> change without notice. Use at your own risk.
+
 # MCP Gateway + Tool-RAG
 
-**Single MCP endpoint** with **semantic tool retrieval**. The gateway proxies
-multiple upstream MCP servers (stdio, SSE, Streamable HTTP) behind one
-authenticated URL; Tool-RAG selects the right tool for each query instead of
-loading every tool description into the model's context.
+**One authenticated MCP endpoint in front of many (potentially hundreds of)
+upstream MCP servers**, with **semantic tool retrieval** so an agent loads only
+the tools relevant to its current query instead of the full catalog.
+
+The point is **context-window economy at catalog scale**: as you connect dozens
+or hundreds of servers, loading every tool's description into the model's context
+becomes impractical. The gateway proxies all upstreams (stdio, SSE, Streamable
+HTTP) behind a single URL, and Tool-RAG does semantic search over the combined
+tool catalog so each query surfaces just the relevant tools.
 
 ## Features
 
@@ -16,6 +25,22 @@ loading every tool description into the model's context.
 - **Persistent registry** — SQLite tool store, synced on startup.
 - **Tool-RAG API** — retrieve, reindex, health, metrics.
 - **LibreChat-ready** — works with the Deferred Tools flow.
+
+### Design notes & caveats
+
+- **The non-admin lockdown is what keeps context small.** `list_tools()` returns
+  `[]` for non-admin keys (`gateway/server.py:40-44`), so a client never loads
+  the full catalog — it must discover tools via `POST /tool-rag/retrieve`. `call_tool`
+  still works for any allowed tool, by name.
+- **Schemas are returned eagerly.** `retrieve` attaches each matched tool's full
+  `input_schema` in the same response — there is no separate "describe tool" call
+  (`tool_rag/router.py:76-93`). This favours **call reliability** (the exact schema
+  is in context when the model builds arguments) at some cost to context savings.
+- **Context savings today = "catalog → top-K," not "names-only shortlist + lazy
+  schema fetch."** Because each returned tool carries its full schema, a retrieve
+  of many tools can still be heavy. The savings scale with **selectivity**:
+  retrieve many, call few. A lighter two-phase discovery is on the
+  [roadmap](#roadmap--future-considerations).
 
 ---
 
@@ -347,6 +372,33 @@ servers/
 config/
   registry.yaml, keys.yaml   (+ .example. variants)
 ```
+
+---
+
+## Roadmap / future considerations
+
+**Two-phase (lazy) tool discovery.** Today `retrieve` returns full schemas
+eagerly (see [Design notes & caveats](#design-notes--caveats)). A lazy flow would
+compress context further at catalog scale:
+
+- **Optional schemas on `retrieve`** — e.g. `include_schema=false` to return a
+  cheap names + description shortlist for discovery.
+- **A per-tool `describe` / `get-schema` endpoint** — fetch the exact
+  `input_schema` on demand, only for the tool the agent actually chose.
+
+This is the original design intent (discover cheaply → fetch schema → call), and
+it maximises context savings. The trade-off:
+
+| | Context savings | Call reliability |
+|---|---|---|
+| **Eager (current)** | weaker — pays for unused schemas | strong — schema always in context |
+| **Lazy (two-phase)** | strong at scale / high selectivity | reliable **only** if the loop enforces fetch-before-call |
+
+**Requirement before switching the default:** lazy mode is only as reliable as
+the agent loop's enforcement that a tool's schema is fetched *before* it may be
+called (the way Deferred-Tools / ToolSearch gating works). Until that guardrail
+exists in the client integration, **eager stays the default**; the optional
+`include_schema=false` + `describe` endpoint can ship first as an opt-in.
 
 ---
 
