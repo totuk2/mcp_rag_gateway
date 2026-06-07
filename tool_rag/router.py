@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
+from gateway.context import current_policy
+from gateway.merge import split_merged_name
 from gateway.tool_db import ToolDb
 from gateway.tool_record import ToolType
 from tool_rag.embedder import Embedder, create_embedder
@@ -60,35 +62,66 @@ class ToolRagRouter:
             return JSONResponse({"detail": "query is required"}, status_code=400)
 
         top_k = int(body.get("top_k", 5))
-        allowed_servers = body.get("allowed_servers")
+        body_servers = body.get("allowed_servers")
         permission_scope = body.get("permission_scope")
         raw_type = body.get("tool_type")
         tool_type: ToolType | None = raw_type if raw_type in ("read", "write", "admin", "action", "query") else None
 
+        # Policy scoping: when auth is on, the caller's AccessPolicy is in context.
+        # Restrict to the key's granted servers (narrowing any body-supplied
+        # allowed_servers, never broadening) and apply tool_prefixes — mirroring
+        # the in-band find_tools meta-tool. When TOOL_RAG_WITHOUT_AUTH=1 there is
+        # no policy in context by design, so enforcement is intentionally skipped.
+        policy = current_policy.get()
+        if policy is not None:
+            granted = set(policy.servers.keys())
+            allowed_servers = (
+                [s for s in body_servers if s in granted] if body_servers else list(granted)
+            )
+            if not allowed_servers:
+                # No servers granted (or body narrowed everything away) -> nothing.
+                return JSONResponse({"query": query, "results": [], "fallback_used": False})
+            # Over-fetch so the post-retrieval tool_prefixes filter doesn't undercount.
+            over = any(r.tool_prefixes for r in policy.servers.values())
+        else:
+            allowed_servers = body_servers
+            over = False
+
+        fetch_k = top_k * 3 if over else top_k
         result = await self._retriever.retrieve(
             query=query,
-            top_k=top_k,
+            top_k=fetch_k,
             allowed_servers=allowed_servers,
             permission_scope=permission_scope,
             tool_type=tool_type,
         )
 
+        results = []
+        for r in result.results:
+            if policy is not None:
+                try:
+                    sid, orig = split_merged_name(r.tool_id)
+                except ValueError:
+                    continue
+                if not policy.tool_visible(sid, orig):
+                    continue  # honour per-key tool_prefixes allowlists
+            results.append({
+                "tool_id": r.tool_id,
+                "tool_name": r.tool_name,
+                "server_name": r.server_name,
+                "score": r.score,
+                "reason": r.reason,
+                "description": r.description,
+                "input_schema": r.input_schema,
+                "status": r.status,
+                "tool_type": r.tool_type,
+            })
+            if len(results) >= top_k:
+                break
+
         return JSONResponse({
             "query": result.query,
-            "results": [
-                {
-                    "tool_id": r.tool_id,
-                    "tool_name": r.tool_name,
-                    "server_name": r.server_name,
-                    "score": r.score,
-                    "reason": r.reason,
-                    "description": r.description,
-                    "input_schema": r.input_schema,
-                    "status": r.status,
-                    "tool_type": r.tool_type,
-                }
-                for r in result.results
-            ],
+            "results": results,
             "fallback_used": result.fallback_used,
         })
 
