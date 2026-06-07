@@ -1,0 +1,10 @@
+services:
+  mcp-gateway:
+    build: .
+    ports:
+      - "${MCP_GATEWAY_PORT:-8765}:8765"
+    volumes:
+      - ./config:/app/config:ro
+    environment:
+      MCP_GATEWAY_CONFIG_DIR: /app/config
+      MCP_GATEWAY_MCP_PATH: /mcp

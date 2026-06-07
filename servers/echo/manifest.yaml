@@ -1,0 +1,6 @@
+# Reference stdio server. `python provision.py` registers this automatically.
+id: echo
+kind: stdio
+# setup runs once; re-runs only when this list changes (or with --force).
+# setup: ["pip install -r requirements.txt"]
+command: ["python", "server.py"]

@@ -1,0 +1,13 @@
+# API keys: each key maps to allowed upstream servers (and optional prefix rules).
+# Prefer secret_hash (sha256 of the raw secret) in anything beyond a lab network.
+keys:
+  - id: dev-full
+    secret: "dev-key-full-access"
+    servers:
+      echo: {}
+
+  - id: dev-restricted
+    secret: "dev-key-restricted"
+    servers:
+      echo:
+        tool_prefixes: ["ping"]

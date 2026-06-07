@@ -1,0 +1,38 @@
+# manifest.yaml reference — drop one of these into servers/<your-server>/manifest.yaml,
+# then run `python provision.py`. The gateway picks it up on next restart and
+# Tool-RAG reindexes automatically.
+#
+# `id` must match [A-Za-z0-9._-]+ and must not contain "__" (it's the namespace
+# separator). Defaults to the directory name if omitted.
+
+# ── kind: stdio ──  built/installed locally, run as a subprocess by the gateway.
+id: my-stdio-server
+kind: stdio
+# Optional one-time install steps. Run from the server directory. Re-run only
+# when this list changes (a .provisioned marker tracks the fingerprint), or with --force.
+setup:
+  - "pip install -r requirements.txt"      # or: "npm ci", "go build -o bin/server ./..."
+command: ["python", "server.py"]            # or: ["node", "dist/index.js"], ["./bin/server"]
+env:                                         # optional, passed to the subprocess
+  LOG_LEVEL: info
+
+# ── kind: docker ──  built from a Dockerfile, run as its own container.
+# Joins the same compose network; the gateway reaches it by service name.
+# id: my-docker-server
+# kind: docker
+# build: .                    # build context (dir holding the Dockerfile), default "."
+# dockerfile: Dockerfile      # default "Dockerfile"
+# port: 9000                  # port the server listens on inside the container
+# transport: streamable_http  # or "sse"
+# path: /mcp                  # MCP path, default /mcp (or /sse for sse)
+# command: ["serve", "--port", "9000"]   # optional container command override
+# env:
+#   API_KEY: changeme
+
+# ── kind: remote ──  already-running server elsewhere; just register its URL.
+# id: my-remote-server
+# kind: remote
+# transport: streamable_http
+# url: "https://example.com/mcp"
+# headers:
+#   Authorization: "Bearer ..."
