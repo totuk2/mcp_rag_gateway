@@ -88,8 +88,8 @@ async def resync_loop(registry, tool_db, indexer, interval):
             logger.exception("Background resync failed")
 
 
-def build_starlette_app(registry, key_store, mcp_path=DEFAULT_MCP_PATH, tool_rag_enabled=False, tool_db=None, tool_rag_router=None, server_health=None):
-    mcp = build_gateway_server(registry)
+def build_starlette_app(registry, key_store, mcp_path=DEFAULT_MCP_PATH, tool_rag_enabled=False, tool_db=None, tool_rag_router=None, server_health=None, retriever=None):
+    mcp = build_gateway_server(registry, retriever=retriever)
     session_manager = StreamableHTTPSessionManager(app=mcp, stateless=True, json_response=False)
     streamable_http_app = StreamableHTTPASGIApp(session_manager)
     is_tr = tool_rag_enabled and tool_rag_router is not None
@@ -170,6 +170,7 @@ def app_from_env():
     tool_rag_enabled = os.environ.get("TOOL_RAG_ENABLED", "1").lower() in ("1", "true")
     tool_db = None
     tool_rag_router = None
+    retriever = None
     server_health = ServerHealth(registry)
     if tool_rag_enabled:
         db_path = os.environ.get("TOOL_RAG_DB", str(base / "tool_registry.db"))
@@ -178,4 +179,4 @@ def app_from_env():
         indexer = ToolRagIndexer(embedder, tool_db)
         retriever = Retriever(embedder, indexer, tool_db, server_health=server_health)
         tool_rag_router = ToolRagRouter(tool_db, embedder, indexer, retriever, server_health=server_health)
-    return build_starlette_app(registry, key_store, mcp_path=mcp_path, tool_rag_enabled=tool_rag_enabled, tool_db=tool_db, tool_rag_router=tool_rag_router, server_health=server_health)
+    return build_starlette_app(registry, key_store, mcp_path=mcp_path, tool_rag_enabled=tool_rag_enabled, tool_db=tool_db, tool_rag_router=tool_rag_router, server_health=server_health, retriever=retriever)

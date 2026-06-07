@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import mcp.types as types
 from mcp.server.lowlevel.helper_types import ReadResourceContents
@@ -24,7 +25,26 @@ from gateway.merge import (
 )
 from gateway.registry import Registry
 
+if TYPE_CHECKING:
+    from tool_rag.retriever import Retriever
+
 logger = logging.getLogger(__name__)
+
+# Name of the always-listed meta-tool that exposes Tool-RAG discovery in-band.
+# Has no "__" so it never collides with a merged {server_id}__{tool} name.
+FIND_TOOLS_NAME = "find_tools"
+
+# Surfaced to clients at MCP `initialize` so the agent knows the catalog is
+# hidden and how to discover tools. Only set when Tool-RAG (the retriever) is on.
+GATEWAY_INSTRUCTIONS = (
+    "This gateway proxies many upstream MCP servers but hides its full tool "
+    "catalog to keep your context small. The only tool listed is "
+    f"`{FIND_TOOLS_NAME}`. To do anything, FIRST call `{FIND_TOOLS_NAME}` with a "
+    "natural-language `query` describing the task; it returns the most relevant "
+    "tools, each with a `call_name` and `input_schema`. THEN call the chosen "
+    "tool directly using its `call_name` (e.g. `serverid__toolname`) with "
+    "arguments matching that schema."
+)
 
 
 def _err_tool(msg: str) -> types.CallToolResult:
@@ -34,15 +54,118 @@ def _err_tool(msg: str) -> types.CallToolResult:
     )
 
 
-def build_gateway_server(registry: Registry) -> Server:
-    server = Server("homelab-mcp-gateway", version="0.1.0")
+def _find_tools_definition() -> types.Tool:
+    """The in-band discovery meta-tool advertised to every key."""
+    return types.Tool(
+        name=FIND_TOOLS_NAME,
+        description=(
+            "Discover tools available through this gateway. The full catalog is "
+            "hidden to save context, so you MUST call this to find a tool before "
+            "you can call it. Describe what you want to accomplish in `query`; "
+            "this returns the most relevant tools with their exact `input_schema` "
+            "and the `call_name` to invoke. Then call the chosen tool directly by "
+            "its `call_name`."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Natural-language description of the task you want to perform.",
+                },
+                "top_k": {
+                    "type": "integer",
+                    "description": "Maximum number of tools to return (default 5).",
+                    "default": 5,
+                },
+            },
+            "required": ["query"],
+        },
+    )
+
+
+def build_gateway_server(registry: Registry, retriever: "Retriever | None" = None) -> Server:
+    # Advertise discovery instructions only when Tool-RAG is wired up.
+    server = Server(
+        "homelab-mcp-gateway",
+        version="0.1.0",
+        instructions=GATEWAY_INSTRUCTIONS if retriever is not None else None,
+    )
+
+    async def handle_find_tools(arguments: dict[str, Any] | None) -> types.CallToolResult:
+        """Semantic tool discovery exposed as an MCP tool (in-band Tool-RAG)."""
+        if retriever is None:
+            return _err_tool("Tool discovery is not enabled on this gateway.")
+        args = arguments or {}
+        query = args.get("query")
+        if not query or not isinstance(query, str):
+            return _err_tool("find_tools requires a non-empty string `query`.")
+        try:
+            top_k = int(args.get("top_k", 5))
+        except (TypeError, ValueError):
+            top_k = 5
+
+        policy = get_policy()
+        allowed = list(policy.servers.keys())
+        if not allowed:
+            # No servers granted to this key -> nothing to discover.
+            payload = {"query": query, "count": 0, "results": [],
+                       "note": "No servers are granted to this API key."}
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=json.dumps(payload))]
+            )
+
+        # Over-fetch: the retriever truncates to its top_k *before* we apply the
+        # per-key tool_prefixes filter below, so a prefix-restricted key would
+        # otherwise see fewer than top_k tools. Fetch extra headroom, then slice.
+        fetch_k = top_k * 3 if any(r.tool_prefixes for r in policy.servers.values()) else top_k
+        result = await retriever.retrieve(query=query, top_k=fetch_k, allowed_servers=allowed)
+
+        results = []
+        for r in result.results:
+            # tool_id is the merged {server_id}__{tool} name == the call_name.
+            try:
+                sid, orig = split_merged_name(r.tool_id)
+            except ValueError:
+                continue
+            if not policy.tool_visible(sid, orig):
+                continue  # honour per-key tool_prefixes allowlists
+            results.append({
+                "call_name": r.tool_id,
+                "server": r.server_name,
+                "tool_type": r.tool_type,
+                "description": r.description,
+                "input_schema": r.input_schema,
+                "score": r.score,
+            })
+            if len(results) >= top_k:
+                break
+
+        payload = {
+            "query": query,
+            "count": len(results),
+            "results": results,
+            "instructions": (
+                "To use a tool, call it directly with its `call_name` as the tool "
+                "name and arguments matching its `input_schema`."
+            ),
+            "fallback_used": result.fallback_used,
+        }
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=json.dumps(payload))]
+        )
 
     @server.list_tools()
     async def handle_list_tools(_req: types.ListToolsRequest) -> types.ListToolsResult:
         policy = get_policy()
+        # The discovery meta-tool is the in-band entry point: it is the ONLY tool
+        # a non-admin key sees, so any MCP client (not just frameworks that know
+        # to POST /tool-rag/retrieve) can find tools. Admin keys see it plus the
+        # full catalog. Omitted entirely when Tool-RAG is disabled.
+        base: list[types.Tool] = [_find_tools_definition()] if retriever is not None else []
         if not policy.admin:
-            return types.ListToolsResult(tools=[])
-        out: list[types.Tool] = []
+            return types.ListToolsResult(tools=base)
+        out: list[types.Tool] = list(base)
 
         async def one(server_id: str) -> list[types.Tool]:
             cfg = registry.servers.get(server_id)
@@ -74,6 +197,8 @@ def build_gateway_server(registry: Registry) -> Server:
     @server.call_tool(validate_input=False)
     async def handle_call_tool(name: str, arguments: dict[str, Any] | None) -> types.CallToolResult:
         policy = get_policy()
+        if name == FIND_TOOLS_NAME:
+            return await handle_find_tools(arguments)
         try:
             server_id, orig = split_merged_name(name)
         except ValueError:
