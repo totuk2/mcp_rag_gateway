@@ -173,7 +173,7 @@ def app_from_env():
     retriever = None
     server_health = ServerHealth(registry)
     if tool_rag_enabled:
-        db_path = os.environ.get("TOOL_RAG_DB", "tool_registry.db")
+        db_path = os.environ.get("TOOL_RAG_DB", str(base / "tool_registry.db"))
         tool_db = ToolDb(db_path)
         embedder = create_embedder()
         indexer = ToolRagIndexer(embedder, tool_db)
