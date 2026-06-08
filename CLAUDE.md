@@ -32,7 +32,7 @@ the gateway. Tool-RAG resyncs and reindexes on startup, so the tools register th
 
 Manifest `kind`:
 - `stdio` — runs `setup` once (fingerprinted via a `.provisioned` marker; `--force` re-runs), registers a stdio subprocess entry.
-- `docker` — emits a service (with a `build:` context) into `docker-compose.servers.yml`, registers a `streamable_http`/`sse` URL (service name in compose, or `127.0.0.1:<port>` with `--host`). The image is built by `docker compose up --build`, not by the provisioner — so provisioning can itself run in a container with no Docker socket (`make up-docker` / `docker compose run --rm provision`).
+- `docker` — emits a service (with a `build:` context) into `docker-compose.servers.yml`, registers a `streamable_http`/`sse` URL (service name in compose, or `127.0.0.1:<port>` with `--host`). The image is built by `docker compose up --build`, not by the provisioner — so provisioning can itself run in a container with no Docker socket (`make up-docker` / `docker compose run --rm provision`). Manifest `env:` → service `environment:` (values pass through verbatim, so `${VAR}` is interpolated from the root `.env` by compose — keep server secrets there, not in the committed manifest); `env_file:` → service `env_file:` (paths relative to `servers/<id>/`, must stay inside the repo). `stdio` `env:` is passed to the subprocess literally (no interpolation, no compose).
 - `remote` — registers an existing URL as-is.
 
 When asked to "add a server from `<url>`/`<git repo>`", follow the **Agent playbook**

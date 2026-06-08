@@ -169,7 +169,16 @@ port: 9000                        # port the server listens on inside the contai
 transport: streamable_http        # or: sse
 path: /mcp                        # MCP path (default /mcp, or /sse for sse)
 # command: ["serve", "--port", "9000"]   # optional, overrides the image CMD
+env:                              # optional, set inside the container
+  LOG_LEVEL: info                 #   literal
+  API_KEY: "${IMAGES_KEY}"        #   interpolated from the root .env at `compose up`
+# env_file: [.env]                # optional env file(s) relative to servers/<id>/
 ```
+
+> **Server secrets:** put a docker server's secret env in the root `.env` and
+> reference it from the manifest as `${VAR}` — `docker compose up` interpolates
+> it, so the secret never lands in the committed manifest. (Interpolation
+> applies to `docker`-kind servers only; `stdio` `env:` values are literal.)
 
 ```yaml
 # stdio — repo that runs as a local process

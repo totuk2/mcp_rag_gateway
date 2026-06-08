@@ -151,7 +151,23 @@ def provision_docker(
         "restart": "unless-stopped",
     }
     if m.get("env"):
+        # Values pass through verbatim, so `${VAR}` / `${VAR:-default}` are
+        # interpolated by `docker compose up` from the root .env (keeps secrets
+        # out of the committed manifest).
         service["environment"] = {str(k): str(v) for k, v in m["env"].items()}
+    if m.get("env_file"):
+        # Per-server env file(s), relative to servers/<id>/, loaded into the
+        # container by compose (e.g. `.env` next to the manifest).
+        raw_files = m["env_file"]
+        files = raw_files if isinstance(raw_files, list) else [raw_files]
+        resolved: list[str] = []
+        for f in files:
+            p = (server_dir / str(f)).resolve()
+            try:
+                resolved.append(str(p.relative_to(ROOT)))
+            except ValueError:
+                raise ManifestError(f"{server_dir}: env_file {f!r} must be inside the repo")
+        service["env_file"] = resolved
     if m.get("command"):
         service["command"] = [str(c) for c in m["command"]]
     if host_mode:
