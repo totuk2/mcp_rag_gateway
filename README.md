@@ -386,9 +386,9 @@ export them in your shell instead. All variables are optional — defaults below
 | Variable                       | Default                  | Purpose                          |
 |--------------------------------|--------------------------|----------------------------------|
 | `MCP_GATEWAY_CONFIG_DIR`       | `./config`               | YAML directory                   |
-| `MCP_GATEWAY_REGISTRY`         | `registry.yaml`          | Hand-written registry path       |
-| `MCP_GATEWAY_REGISTRY_GENERATED` | `registry.generated.yaml` | Provisioner-generated registry |
-| `MCP_GATEWAY_KEYS`             | `keys.yaml`              | API keys path                    |
+| `MCP_GATEWAY_REGISTRY`         | `<config>/registry.yaml` | Hand-written registry path — **absolute when set** (not joined with `CONFIG_DIR`); leave unset to use the default |
+| `MCP_GATEWAY_REGISTRY_GENERATED` | `<config>/registry.generated.yaml` | Provisioner-generated registry — absolute when set |
+| `MCP_GATEWAY_KEYS`             | `<config>/keys.yaml`     | API keys path — absolute when set |
 | `MCP_GATEWAY_MCP_PATH`         | `/mcp`                   | MCP HTTP path                    |
 | `MCP_GATEWAY_HOST`             | `0.0.0.0`                | Bind address                     |
 | `MCP_GATEWAY_PORT`             | `8765`                   | Port                             |
