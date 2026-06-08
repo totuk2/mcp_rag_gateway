@@ -9,3 +9,18 @@ services:
       MCP_GATEWAY_CONFIG_DIR: /app/config
       MCP_GATEWAY_MCP_PATH: /mcp
       GATEWAY_ANON_KEY: anon
+
+  # One-shot provisioner: turns servers/*/manifest.yaml into
+  # config/registry.generated.yaml + docker-compose.servers.yml. Reuses the
+  # gateway image (PyYAML is already installed) and mounts the repo so the
+  # generated files land on the host. No Docker socket needed — docker-kind
+  # servers are built by `docker compose up --build`, not here.
+  # Run with: docker compose run --rm provision   (append flags, e.g. --force)
+  # `profiles` keeps it out of a plain `docker compose up`.
+  provision:
+    build: .
+    profiles: ["tools"]
+    working_dir: /app
+    volumes:
+      - .:/app
+    entrypoint: ["python", "provision.py"]

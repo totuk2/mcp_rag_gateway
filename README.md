@@ -83,8 +83,23 @@ python -m gateway                 # uvicorn on 0.0.0.0:8765
 
 ```bash
 docker compose up --build         # gateway only; mounts ./config read-only
-make up                           # provision + gateway + provisioned docker servers
+make up                           # provision (host Python) + gateway + provisioned docker servers
+make up-docker                    # same, but provisioning runs in a container too — no host Python needed
 ```
+
+`make up-docker` is the fully-containerized path. It runs provisioning in a
+throwaway container (the gateway image already has PyYAML; the repo is mounted so
+the generated files land on the host), then builds and runs the gateway and every
+docker-kind server together:
+
+```bash
+docker compose run --rm provision                                  # generate registry + servers compose
+docker compose -f docker-compose.yml -f docker-compose.servers.yml up --build
+```
+
+Docker-kind servers are **built by `compose up --build`**, not by the provisioner —
+so the provisioner needs no Docker socket. Pass flags through `run`, e.g.
+`docker compose run --rm provision --force`.
 
 ---
 
@@ -188,11 +203,12 @@ What each `kind` does:
 | kind     | What provision does                                                         | Registered as                                 |
 |----------|-----------------------------------------------------------------------------|-----------------------------------------------|
 | `stdio`  | runs `setup` once (re-runs only when it changes, or with `--force`)         | stdio subprocess (`command` / `args` / `cwd`) |
-| `docker` | `docker build` the image, emits a service into `docker-compose.servers.yml` | `streamable_http`/`sse` URL                   |
+| `docker` | emits a service (with `build:` context) into `docker-compose.servers.yml`; the image is built by `compose up --build` | `streamable_http`/`sse` URL                   |
 | `remote` | nothing to build                                                            | the given URL, as-is                          |
 
 Flags: `--host` (gateway runs on the host → docker servers publish ports on
-`127.0.0.1`), `--force` (re-run setup / rebuild images), `--only <id>`.
+`127.0.0.1`), `--force` (re-run stdio `setup` steps; docker images are rebuilt by
+`compose up --build`, not here), `--only <id>`.
 
 See `servers/MANIFEST.example.yaml` for the full field reference, and
 `servers/echo/` for a working stdio example.
