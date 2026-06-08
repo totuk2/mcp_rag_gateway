@@ -282,12 +282,27 @@ Final ranking score = `1.0 × semantic + 0.25 × keyword + 0.15 × metadata + po
 with a deterministic tie-break on `tool_id`. If the index is empty it falls back
 to a keyword scan (`fallback_used: true`).
 
+**Optional cross-encoder reranking.** With `TOOL_RAG_RERANKER=local`, a second
+stage scores each `(query, tool)` pair jointly with a small multilingual
+cross-encoder and replaces the bi-encoder's `semantic` term — far better
+precision when surface tokens mislead the bi-encoder (e.g. an image tool that
+mentions `http://` outranking a docs tool for a "Streamable HTTP" query). It
+runs only on the FAISS shortlist (bounded to 50 candidates), so cost stays fixed
+at catalog scale. Default off (no extra model download). Pairs naturally with a
+stronger multilingual `url` embedder.
+
 ### Startup, refresh, and liveness
 
 - **Clean rebuild on startup.** `TOOL_RAG_STARTUP_REINDEX=full` (default) rebuilds
   the index from scratch each boot, so added/changed/removed tools are reflected
   and the index stays leak-free. `incremental` only re-embeds changed tools;
   `off` skips reindex and uses the persisted index as-is.
+- **Changing the embedding model is safe.** The index meta records the
+  embedder's `dim` and `model_id`; on startup `indexer._load()` rebuilds the
+  index from scratch if either differs from the current embedder — so swapping
+  the model (or its dimension) is just "change the env var, restart," with no
+  stale-vector trap even under `incremental`/`off` reindex. (Update
+  `TOOL_RAG_EMBED_DIM` to match the new model, or unset it to auto-probe.)
 - **Removed servers/tools are purged.** Each startup sync reconciles the registry:
   tools of a server no longer in the registry are deleted from the DB (and drop
   out of the rebuilt index). Just remove the server and restart.
@@ -354,8 +369,13 @@ Index size, DB size, `started_at`.
 | `MCP_GATEWAY_HOST`             | `0.0.0.0`                | Bind address                     |
 | `MCP_GATEWAY_PORT`             | `8765`                   | Port                             |
 | `TOOL_RAG_ENABLED`             | `1`                      | Enable Tool-RAG                  |
-| `TOOL_RAG_EMBEDDER`            | `local`                  | `local` or `api`                 |
-| `TOOL_RAG_EMBED_URL`           | —                        | Remote embedding API URL         |
+| `TOOL_RAG_EMBEDDER`            | `local`                  | `local` (sentence-transformers) or `url` (remote OpenAI-shaped API; `api` is a legacy alias) |
+| `TOOL_RAG_EMBED_URL`           | —                        | Full remote embeddings endpoint, e.g. `http://ollama:11434/v1/embeddings` (not the base URL) |
+| `TOOL_RAG_EMBED_MODEL`         | `text-embedding-3-small` | Model name sent to the embeddings API (set to your Ollama tag, e.g. `hf.co/Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0`) |
+| `TOOL_RAG_EMBED_API_KEY`       | —                        | Bearer token for the embeddings API (optional; omit for keyless Ollama) |
+| `TOOL_RAG_EMBED_DIM`           | —                        | Embedding dimension for the `url` embedder (e.g. `1024` for Qwen3-0.6B). If unset it is probed once at startup (requires the endpoint reachable at boot) |
+| `TOOL_RAG_RERANKER`            | `off`                    | `off` or `local` — cross-encoder reranking of FAISS candidates |
+| `TOOL_RAG_RERANKER_MODEL`      | `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` | Cross-encoder model (small, multilingual, 14 languages) |
 | `TOOL_RAG_DB`                  | `tool_registry.db`       | SQLite path                      |
 | `TOOL_RAG_WITHOUT_AUTH`        | `0`                      | Skip auth for `/tool-rag/`       |
 | `TOOL_RAG_STARTUP_REINDEX`     | `full`                   | `full` \| `incremental` \| `off` — index strategy at startup |

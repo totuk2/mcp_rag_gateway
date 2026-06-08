@@ -22,6 +22,7 @@ from gateway.server import build_gateway_server
 from gateway.sync_adapter import SyncAdapter
 from gateway.tool_db import ToolDb
 from tool_rag.embedder import create_embedder
+from tool_rag.reranker import create_reranker
 from tool_rag.indexer import ToolRagIndexer
 from tool_rag.retriever import Retriever
 from tool_rag.router import ToolRagRouter
@@ -198,7 +199,8 @@ def app_from_env():
         tool_db = ToolDb(db_path)
         embedder = create_embedder()
         indexer = ToolRagIndexer(embedder, tool_db)
-        retriever = Retriever(embedder, indexer, tool_db, server_health=server_health)
+        reranker = create_reranker()
+        retriever = Retriever(embedder, indexer, tool_db, server_health=server_health, reranker=reranker)
         tool_rag_router = ToolRagRouter(tool_db, embedder, indexer, retriever, server_health=server_health)
     anon_key_id = os.environ.get("GATEWAY_ANON_KEY", "").strip()
     anon_policy = key_store.by_id(anon_key_id) if anon_key_id else None

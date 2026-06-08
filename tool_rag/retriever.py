@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Sequence
 from tool_rag.embedder import Embedder
 from tool_rag.indexer import ToolRagIndexer
 from tool_rag.ranker import Ranker
+from tool_rag.reranker import MAX_RERANK_CANDIDATES, Reranker
 from gateway.tool_db import ToolDb
 from gateway.tool_record import ToolRecord, ToolStatus, ToolType
 
@@ -60,12 +61,14 @@ class Retriever:
         tool_db: ToolDb,
         ranker: Ranker | None = None,
         server_health: "ServerHealth | None" = None,
+        reranker: Reranker | None = None,
     ):
         self._embedder = embedder
         self._indexer = indexer
         self._tool_db = tool_db
         self._ranker = ranker or Ranker()
         self._server_health = server_health
+        self._reranker = reranker
 
     async def retrieve(
         self,
@@ -79,21 +82,24 @@ class Retriever:
         # 1. Embed
         query_vec = self._embedder.embed(query)
 
-        # 2. FAISS search (fetch more than top_k for filtering headroom)
-        candidates = self._indexer.search(query_vec, top_k=top_k * 2)
+        # 2. FAISS search. With a reranker, widen first-stage recall (the
+        # cross-encoder can only reorder what FAISS returns) but bound the pool
+        # so cross-encoder cost stays fixed at catalog scale; without one, the
+        # original top_k*2 headroom for filtering suffices.
+        fetch_n = max(top_k, MAX_RERANK_CANDIDATES) if self._reranker else top_k * 2
+        candidates = self._indexer.search(query_vec, top_k=fetch_n)
 
         if not candidates:
             logger.info("No index candidates for query=%r, falling back to DB scan", query)
             return self._fallback(query, top_k, allowed_servers, permission_scope, tool_type)
 
-        # 3. Fetch full records + filter + rank
-        scored: list[tuple[float, ToolRecord]] = []
+        # 3. Fetch full records + apply mandatory filters (section 7.7),
+        # preserving FAISS order (most semantically relevant first).
+        filtered: list[tuple[ToolRecord, float]] = []
         for tid, semantic_score in candidates:
             record = self._tool_db.get_tool(tid)
             if record is None:
                 continue
-
-            # Filter by mandatory filters (section 7.7)
             if allowed_servers and record.server_id not in allowed_servers:
                 continue
             if permission_scope and record.permission_scope != permission_scope:
@@ -104,7 +110,20 @@ class Retriever:
                 continue
             if self._server_health and not self._server_health.is_up(record.server_id):
                 continue  # upstream currently unreachable — don't surface its tools
+            filtered.append((record, semantic_score))
 
+        # 3b. Optional cross-encoder rerank: replace the bi-encoder semantic
+        # score with a jointly-scored (query, tool) relevance in [0,1]. Bounded
+        # to the top MAX_RERANK_CANDIDATES by FAISS order.
+        if self._reranker is not None and filtered:
+            pool = filtered[:MAX_RERANK_CANDIDATES]
+            docs = [f"{rec.tool_name}: {rec.description}" for rec, _ in pool]
+            rerank_scores = self._reranker.score(query, docs)
+            filtered = [(rec, rs) for (rec, _), rs in zip(pool, rerank_scores)]
+
+        # 4. Rank with the (possibly reranked) semantic score, sort, tie-break
+        scored: list[tuple[float, ToolRecord]] = []
+        for record, semantic_score in filtered:
             final_score = self._ranker.compute_score(
                 query=query,
                 record=record,
@@ -115,7 +134,7 @@ class Retriever:
             )
             scored.append((final_score, record))
 
-        # 4. Sort by score desc, tie-break by tool_id
+        # Sort by score desc, tie-break by tool_id
         scored.sort(key=lambda x: (-x[0], x[1].tool_id))
         top = scored[:top_k]
 

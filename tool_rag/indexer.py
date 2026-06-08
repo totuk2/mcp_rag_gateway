@@ -105,6 +105,7 @@ class ToolRagIndexer:
                 "tool_to_id": self._tool_to_id,
                 "next_id": self._next_id,
                 "dim": self._dim,
+                "embedder": self._embedder.model_id,
             })
         )
 
@@ -114,6 +115,23 @@ class ToolRagIndexer:
         meta = json.loads(self._meta_path.read_text())
         if meta.get("version") != META_VERSION:
             raise ValueError(f"index meta version {meta.get('version')} != {META_VERSION}")
+        # Reject a persisted index built with a different embedder dimension
+        # (e.g. switching all-MiniLM 384 → Qwen3 1024) — raising here triggers a
+        # clean rebuild via _load_or_create instead of crashing at query time.
+        persisted_dim = int(meta["dim"])
+        if persisted_dim != self._embedder.dimension:
+            raise ValueError(
+                f"index dim {persisted_dim} != embedder dim {self._embedder.dimension}"
+            )
+        # Reject an index built by a different model+endpoint even at the same
+        # dimension (the vector spaces are incompatible) — forces a clean rebuild
+        # on model change regardless of TOOL_RAG_STARTUP_REINDEX mode. Old metas
+        # lack this key, so they rebuild once (harmless).
+        persisted_embedder = meta.get("embedder")
+        if persisted_embedder != self._embedder.model_id:
+            raise ValueError(
+                f"index embedder {persisted_embedder!r} != {self._embedder.model_id!r}"
+            )
         self._tool_to_id = {str(k): int(v) for k, v in meta["tool_to_id"].items()}
         self._id_to_tool = {v: k for k, v in self._tool_to_id.items()}
         self._next_id = int(meta["next_id"])
