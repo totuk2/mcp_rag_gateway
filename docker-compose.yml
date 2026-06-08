@@ -8,3 +8,4 @@ services:
     environment:
       MCP_GATEWAY_CONFIG_DIR: /app/config
       MCP_GATEWAY_MCP_PATH: /mcp
+      GATEWAY_ANON_KEY: anon

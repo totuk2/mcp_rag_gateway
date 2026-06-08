@@ -70,6 +70,15 @@ class KeyStore:
                 return policy
         return None
 
+    def by_id(self, key_id: str) -> AccessPolicy | None:
+        for policy in self._plaintext.values():
+            if policy.key_id == key_id:
+                return policy
+        for _, policy in self._hashed:
+            if policy.key_id == key_id:
+                return policy
+        return None
+
 
 def load_keys(path: Path) -> KeyStore:
     return KeyStore.from_yaml(path)
