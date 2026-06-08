@@ -119,6 +119,9 @@ so the provisioner needs no Docker socket. Pass flags through `run`, e.g.
 **In one sentence:** put the server in `servers/<id>/`, describe it in a
 `manifest.yaml`, run `python provision.py`, grant a key, restart.
 
+**Or do it the easiest way:** let `claude` handle it using SKILL `add-mcp` followed by URL of the 
+MCP server or pointing to a server code in the `servers/*` folder.
+
 ### Agent playbook: add a server from a URL or repo
 
 This repo is built so an AI agent can add a server from a single instruction like
