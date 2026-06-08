@@ -81,8 +81,17 @@ python -m gateway                 # uvicorn on 0.0.0.0:8765
 
 ### Docker
 
+Configuration is read from a `.env` file (loaded by the gateway service's
+`env_file`). Copy the template and edit:
+
 ```bash
-docker compose up --build         # gateway only; mounts ./config read-only
+cp .env.example .env              # then tweak; .env is gitignored (may hold secrets)
+```
+
+`.env` is optional — the gateway boots on built-in defaults if it's absent.
+
+```bash
+docker compose up --build         # gateway only; mounts ./config read-only, loads .env
 make up                           # provision (host Python) + gateway + provisioned docker servers
 make up-docker                    # same, but provisioning runs in a container too — no host Python needed
 ```
@@ -356,6 +365,10 @@ Index size, DB size, `started_at`.
 ---
 
 ## Configuration
+
+Under Docker, set these in `.env` (copy `.env.example`); it's loaded into the
+gateway container at `docker compose up`. For a host run (`python -m gateway`),
+export them in your shell instead. All variables are optional — defaults below.
 
 ### Environment variables
 

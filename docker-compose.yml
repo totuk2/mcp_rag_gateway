@@ -5,10 +5,15 @@ services:
       - "${MCP_GATEWAY_PORT:-8765}:8765"
     volumes:
       - ./config:/app/config:ro
+    # All config lives in .env (copy from .env.example). Not required, so the
+    # gateway still boots on app defaults if .env is absent.
+    env_file:
+      - path: .env
+        required: false
     environment:
+      # Fixed in-container path (tied to the volume mount above) — pinned here so
+      # it can't be overridden by an errant .env value.
       MCP_GATEWAY_CONFIG_DIR: /app/config
-      MCP_GATEWAY_MCP_PATH: /mcp
-      GATEWAY_ANON_KEY: anon
 
   # One-shot provisioner: turns servers/*/manifest.yaml into
   # config/registry.generated.yaml + docker-compose.servers.yml. Reuses the
