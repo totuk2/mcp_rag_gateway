@@ -1,0 +1,9 @@
+# mcp-images — fetches/processes images from URLs or local paths (fetch_images).
+# Built from its Dockerfile; serves Streamable HTTP on :8000/mcp
+# (Dockerfile sets MCP_TRANSPORT=streamable-http, MCP_HOST=0.0.0.0, MCP_PORT=8000).
+id: images
+kind: docker
+build: .
+port: 8000
+transport: streamable_http
+path: /mcp

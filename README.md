@@ -18,7 +18,8 @@ tool catalog so each query surfaces just the relevant tools.
 
 - **Unified MCP endpoint** — one URL, many upstream servers behind auth.
 - **Semantic tool retrieval** — FAISS + sentence-transformers search.
-- **In-band discovery** — non-admin keys see a single `find_tools` meta-tool via `list_tools()`; calling it runs semantic retrieval and returns matching tools + schemas. Works with any MCP client, no out-of-band config.
+- **In-band discovery** — non-admin keys see two meta-tools via `list_tools()`: `find_tools` (semantic retrieval → matching tools + schemas) and `run_tool` (execute any discovered tool). Works with any MCP client, no out-of-band config.
+- **Strict-client support** — after `find_tools`, the gateway registers the discovered tools for that session and emits `tools/list_changed`, so clients that validate calls against the advertised list (e.g. LibreChat) can call them.
 - **Multi-transport** — stdio, SSE, Streamable HTTP upstreams.
 - **Per-key policies** — server + prefix filters per API key.
 - **Agent-friendly provisioning** — add a server from a URL or git repo with one command; an AI agent can follow the [playbook](#agent-playbook-add-a-server-from-a-url-or-repo) end-to-end.
@@ -29,10 +30,10 @@ tool catalog so each query surfaces just the relevant tools.
 ### Design notes & caveats
 
 - **The non-admin lockdown is what keeps context small.** `list_tools()` returns
-  only the `find_tools` meta-tool for non-admin keys (`gateway/server.py`), so a
-  client never loads the full catalog. The agent discovers tools by *calling*
-  `find_tools` (in-band, MCP-native). `call_tool` then works for any allowed tool,
-  by name.
+  only the `find_tools` + `run_tool` meta-tools for non-admin keys
+  (`gateway/server.py`), so a client never loads the full catalog. The agent
+  discovers tools by *calling* `find_tools` (in-band, MCP-native), then executes
+  them via `run_tool` (or by name, for clients that allow unlisted calls).
 - **Both discovery paths are policy-scoped.** `find_tools` and `POST
   /tool-rag/retrieve` both read the caller's `AccessPolicy` and restrict results
   to the key's granted servers + `tool_prefixes`. A body-supplied `allowed_servers`
@@ -43,13 +44,14 @@ tool catalog so each query surfaces just the relevant tools.
   can). `find_tools` is therefore the only discovery path a generic agent can
   reach on its own. The gateway also sets the MCP `initialize` `instructions` field
   telling the agent to call `find_tools` first.
-- **Callability caveat (strict clients).** `find_tools` returns a tool's
-  `call_name`, but that tool was never in `list_tools()`. This gateway's
-  `call_tool` executes any *allowed* tool regardless of listing, so it just works —
-  **provided the client lets the model emit a call to an unlisted name.** Clients
-  that validate calls against the advertised list would reject it; supporting them
-  cleanly needs `tools/list_changed` dynamics (see
-  [roadmap](#roadmap--future-considerations)).
+- **Calling discovered tools.** `find_tools` returns each tool's `call_name`. Two
+  ways to execute it: the `run_tool` meta-tool (always works — it's in
+  `list_tools()`), or a direct call by `call_name`. The direct call works on this
+  gateway (`call_tool` executes any *allowed* tool regardless of listing) **for
+  clients that let the model emit an unlisted name**; for strict clients that
+  validate against the advertised list, `find_tools` registers the discovered
+  tools for the session and emits `tools/list_changed` so they re-fetch and accept
+  the call (`run_tool` sidesteps the issue entirely).
 - **Schemas are returned eagerly.** Both `find_tools` and `/tool-rag/retrieve`
   attach each matched tool's full `input_schema` in the same response — there is
   no separate "describe tool" call (`tool_rag/router.py:76-93`). This favours
@@ -81,10 +83,34 @@ python -m gateway                 # uvicorn on 0.0.0.0:8765
 
 ### Docker
 
+Configuration is read from a `.env` file (loaded by the gateway service's
+`env_file`). Copy the template and edit:
+
 ```bash
-docker compose up --build         # gateway only; mounts ./config read-only
-make up                           # provision + gateway + provisioned docker servers
+cp .env.example .env              # then tweak; .env is gitignored (may hold secrets)
 ```
+
+`.env` is optional — the gateway boots on built-in defaults if it's absent.
+
+```bash
+docker compose up --build         # gateway only; mounts ./config read-only, loads .env
+make up                           # provision (host Python) + gateway + provisioned docker servers
+make up-docker                    # same, but provisioning runs in a container too — no host Python needed
+```
+
+`make up-docker` is the fully-containerized path. It runs provisioning in a
+throwaway container (the gateway image already has PyYAML; the repo is mounted so
+the generated files land on the host), then builds and runs the gateway and every
+docker-kind server together:
+
+```bash
+docker compose run --rm provision                                  # generate registry + servers compose
+docker compose -f docker-compose.yml -f docker-compose.servers.yml up --build
+```
+
+Docker-kind servers are **built by `compose up --build`**, not by the provisioner —
+so the provisioner needs no Docker socket. Pass flags through `run`, e.g.
+`docker compose run --rm provision --force`.
 
 ---
 
@@ -145,7 +171,16 @@ port: 9000                        # port the server listens on inside the contai
 transport: streamable_http        # or: sse
 path: /mcp                        # MCP path (default /mcp, or /sse for sse)
 # command: ["serve", "--port", "9000"]   # optional, overrides the image CMD
+env:                              # optional, set inside the container
+  LOG_LEVEL: info                 #   literal
+  API_KEY: "${IMAGES_KEY}"        #   interpolated from the root .env at `compose up`
+# env_file: [.env]                # optional env file(s) relative to servers/<id>/
 ```
+
+> **Server secrets:** put a docker server's secret env in the root `.env` and
+> reference it from the manifest as `${VAR}` — `docker compose up` interpolates
+> it, so the secret never lands in the committed manifest. (Interpolation
+> applies to `docker`-kind servers only; `stdio` `env:` values are literal.)
 
 ```yaml
 # stdio — repo that runs as a local process
@@ -188,11 +223,12 @@ What each `kind` does:
 | kind     | What provision does                                                         | Registered as                                 |
 |----------|-----------------------------------------------------------------------------|-----------------------------------------------|
 | `stdio`  | runs `setup` once (re-runs only when it changes, or with `--force`)         | stdio subprocess (`command` / `args` / `cwd`) |
-| `docker` | `docker build` the image, emits a service into `docker-compose.servers.yml` | `streamable_http`/`sse` URL                   |
+| `docker` | emits a service (with `build:` context) into `docker-compose.servers.yml`; the image is built by `compose up --build` | `streamable_http`/`sse` URL                   |
 | `remote` | nothing to build                                                            | the given URL, as-is                          |
 
 Flags: `--host` (gateway runs on the host → docker servers publish ports on
-`127.0.0.1`), `--force` (re-run setup / rebuild images), `--only <id>`.
+`127.0.0.1`), `--force` (re-run stdio `setup` steps; docker images are rebuilt by
+`compose up --build`, not here), `--only <id>`.
 
 See `servers/MANIFEST.example.yaml` for the full field reference, and
 `servers/echo/` for a working stdio example.
@@ -266,12 +302,29 @@ Final ranking score = `1.0 × semantic + 0.25 × keyword + 0.15 × metadata + po
 with a deterministic tie-break on `tool_id`. If the index is empty it falls back
 to a keyword scan (`fallback_used: true`).
 
+**Optional cross-encoder reranking.** With `TOOL_RAG_RERANKER=local`, a second
+stage scores each `(query, tool)` pair jointly with a small multilingual
+cross-encoder and replaces the bi-encoder's `semantic` term — far better
+precision when surface tokens mislead the bi-encoder (e.g. an image tool that
+mentions `http://` outranking a docs tool for a "Streamable HTTP" query). It
+runs only on the FAISS shortlist (bounded to 50 candidates), so cost stays fixed
+at catalog scale. Default off (no extra model download). Pairs naturally with a
+stronger multilingual `url` embedder. When `TOOL_RAG_RERANKER=local`, `docker
+compose build` bakes the model into the image (warm at boot, no runtime HF fetch);
+the `hf-cache` volume otherwise downloads it lazily on first use and persists it.
+
 ### Startup, refresh, and liveness
 
 - **Clean rebuild on startup.** `TOOL_RAG_STARTUP_REINDEX=full` (default) rebuilds
   the index from scratch each boot, so added/changed/removed tools are reflected
   and the index stays leak-free. `incremental` only re-embeds changed tools;
   `off` skips reindex and uses the persisted index as-is.
+- **Changing the embedding model is safe.** The index meta records the
+  embedder's `dim` and `model_id`; on startup `indexer._load()` rebuilds the
+  index from scratch if either differs from the current embedder — so swapping
+  the model (or its dimension) is just "change the env var, restart," with no
+  stale-vector trap even under `incremental`/`off` reindex. (Update
+  `TOOL_RAG_EMBED_DIM` to match the new model, or unset it to auto-probe.)
 - **Removed servers/tools are purged.** Each startup sync reconciles the registry:
   tools of a server no longer in the registry are deleted from the DB (and drop
   out of the rebuilt index). Just remove the server and restart.
@@ -326,20 +379,29 @@ Index size, DB size, `started_at`.
 
 ## Configuration
 
+Under Docker, set these in `.env` (copy `.env.example`); it's loaded into the
+gateway container at `docker compose up`. For a host run (`python -m gateway`),
+export them in your shell instead. All variables are optional — defaults below.
+
 ### Environment variables
 
 | Variable                       | Default                  | Purpose                          |
 |--------------------------------|--------------------------|----------------------------------|
 | `MCP_GATEWAY_CONFIG_DIR`       | `./config`               | YAML directory                   |
-| `MCP_GATEWAY_REGISTRY`         | `registry.yaml`          | Hand-written registry path       |
-| `MCP_GATEWAY_REGISTRY_GENERATED` | `registry.generated.yaml` | Provisioner-generated registry |
-| `MCP_GATEWAY_KEYS`             | `keys.yaml`              | API keys path                    |
+| `MCP_GATEWAY_REGISTRY`         | `<config>/registry.yaml` | Hand-written registry path — **absolute when set** (not joined with `CONFIG_DIR`); leave unset to use the default |
+| `MCP_GATEWAY_REGISTRY_GENERATED` | `<config>/registry.generated.yaml` | Provisioner-generated registry — absolute when set |
+| `MCP_GATEWAY_KEYS`             | `<config>/keys.yaml`     | API keys path — absolute when set |
 | `MCP_GATEWAY_MCP_PATH`         | `/mcp`                   | MCP HTTP path                    |
 | `MCP_GATEWAY_HOST`             | `0.0.0.0`                | Bind address                     |
 | `MCP_GATEWAY_PORT`             | `8765`                   | Port                             |
 | `TOOL_RAG_ENABLED`             | `1`                      | Enable Tool-RAG                  |
-| `TOOL_RAG_EMBEDDER`            | `local`                  | `local` or `api`                 |
-| `TOOL_RAG_EMBED_URL`           | —                        | Remote embedding API URL         |
+| `TOOL_RAG_EMBEDDER`            | `local`                  | `local` (sentence-transformers) or `url` (remote OpenAI-shaped API; `api` is a legacy alias) |
+| `TOOL_RAG_EMBED_URL`           | —                        | Full remote embeddings endpoint, e.g. `http://ollama:11434/v1/embeddings` (not the base URL) |
+| `TOOL_RAG_EMBED_MODEL`         | `text-embedding-3-small` | Model name sent to the embeddings API (set to your Ollama tag, e.g. `hf.co/Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0`) |
+| `TOOL_RAG_EMBED_API_KEY`       | —                        | Bearer token for the embeddings API (optional; omit for keyless Ollama) |
+| `TOOL_RAG_EMBED_DIM`           | —                        | Embedding dimension for the `url` embedder (e.g. `1024` for Qwen3-0.6B). If unset it is probed once at startup (requires the endpoint reachable at boot) |
+| `TOOL_RAG_RERANKER`            | `off`                    | `off` or `local` — cross-encoder reranking of FAISS candidates |
+| `TOOL_RAG_RERANKER_MODEL`      | `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` | Cross-encoder model (small, multilingual, 14 languages) |
 | `TOOL_RAG_DB`                  | `tool_registry.db`       | SQLite path                      |
 | `TOOL_RAG_WITHOUT_AUTH`        | `0`                      | Skip auth for `/tool-rag/`       |
 | `TOOL_RAG_STARTUP_REINDEX`     | `full`                   | `full` \| `incremental` \| `off` — index strategy at startup |
@@ -354,20 +416,24 @@ Index size, DB size, `started_at`.
 
 ### LibreChat
 
-Point an MCP server at `http://gateway:8765/mcp` with a **non-admin** token. The
-Deferred Tools flow discovers tools through `/tool-rag/retrieve` at runtime
-instead of loading the full catalog.
+Point an MCP server at `http://gateway:8765/mcp` with a **non-admin** token.
+Discovery is in-band: `list_tools()` exposes only `find_tools` + `run_tool`, and
+after `find_tools` the gateway emits `tools/list_changed` so LibreChat picks up
+and calls the discovered tools — no full catalog loaded. (The Deferred Tools flow
+can also call `POST /tool-rag/retrieve` directly; it's policy-scoped the same way.)
 
 ### Generic MCP clients (in-band)
 
-Connect to `/mcp` with a **non-admin** token. `list_tools()` returns a single
-`find_tools` tool (and the `initialize` instructions explain it). The agent:
+Connect to `/mcp` with a **non-admin** token. `list_tools()` returns the
+`find_tools` + `run_tool` meta-tools (and the `initialize` instructions explain
+them). The agent:
 
 1. Calls `find_tools` with `{"query": "<what you want to do>"}` (optional `top_k`).
 2. Reads the returned `results` — each has a `call_name`, `description`, and full
    `input_schema`.
-3. Calls the chosen tool directly via `/mcp` using its `call_name`
-   (the merged `server_id__tool` name).
+3. Executes the chosen tool with `run_tool` (`{"call_name": "<server__tool>",
+   "arguments": {...}}`) — or calls the `call_name` directly if the client allows
+   unlisted names.
 
 No out-of-band knowledge of `/tool-rag/*` is required — discovery is fully in the
 MCP protocol. (Frameworks may still call `POST /tool-rag/retrieve` directly; it
@@ -398,6 +464,7 @@ tool_rag/
   embedder.py           text -> vector (local sentence-transformers or remote API)
   indexer.py            FAISS index (IndexIDMap(IndexFlatIP), removable vectors)
   ranker.py             scoring
+  reranker.py           optional cross-encoder rerank stage
   retriever.py          query -> top-K pipeline
   router.py             /tool-rag/* route handlers
 servers/
@@ -410,15 +477,6 @@ config/
 ---
 
 ## Roadmap / future considerations
-
-**Dynamic tool listing for strict clients.** `find_tools` makes discovery
-in-band, but the tools it surfaces are not in `list_tools()`, so clients that
-validate `tools/call` against the advertised list will reject them (see the
-callability caveat above). A future option: after `find_tools`, emit
-`notifications/tools/list_changed` and surface the discovered tools per session
-so strict clients re-fetch and accept the call. Harder here because upstream
-sessions are stateless/per-request — there is no per-connection tool set to
-mutate today.
 
 **Two-phase (lazy) tool discovery.** Today both `find_tools` and `retrieve`
 return full schemas eagerly (see [Design notes & caveats](#design-notes--caveats)).

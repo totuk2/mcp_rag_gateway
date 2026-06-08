@@ -1,10 +1,44 @@
 services:
   mcp-gateway:
-    build: .
+    build:
+      context: .
+      args:
+        # Interpolated from .env. When TOOL_RAG_RERANKER=local, the Dockerfile
+        # bakes the reranker model into the image (warm at boot, no runtime HF
+        # fetch). Otherwise the build skips it.
+        TOOL_RAG_RERANKER: ${TOOL_RAG_RERANKER:-off}
+        TOOL_RAG_RERANKER_MODEL: ${TOOL_RAG_RERANKER_MODEL:-cross-encoder/mmarco-mMiniLMv2-L12-H384-v1}
     ports:
       - "${MCP_GATEWAY_PORT:-8765}:8765"
     volumes:
       - ./config:/app/config:ro
+      # Persist the HuggingFace cache (local embedder + reranker models) so they
+      # download once instead of on every container recreate.
+      - hf-cache:/root/.cache/huggingface
+    # All config lives in .env (copy from .env.example). Not required, so the
+    # gateway still boots on app defaults if .env is absent.
+    env_file:
+      - path: .env
+        required: false
     environment:
+      # Fixed in-container path (tied to the volume mount above) — pinned here so
+      # it can't be overridden by an errant .env value.
       MCP_GATEWAY_CONFIG_DIR: /app/config
-      MCP_GATEWAY_MCP_PATH: /mcp
+
+  # One-shot provisioner: turns servers/*/manifest.yaml into
+  # config/registry.generated.yaml + docker-compose.servers.yml. Reuses the
+  # gateway image (PyYAML is already installed) and mounts the repo so the
+  # generated files land on the host. No Docker socket needed — docker-kind
+  # servers are built by `docker compose up --build`, not here.
+  # Run with: docker compose run --rm provision   (append flags, e.g. --force)
+  # `profiles` keeps it out of a plain `docker compose up`.
+  provision:
+    build: .
+    profiles: ["tools"]
+    working_dir: /app
+    volumes:
+      - .:/app
+    entrypoint: ["python", "provision.py"]
+
+volumes:
+  hf-cache:

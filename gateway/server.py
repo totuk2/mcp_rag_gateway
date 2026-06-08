@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import weakref
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
@@ -26,25 +27,57 @@ from gateway.merge import (
 from gateway.registry import Registry
 
 if TYPE_CHECKING:
+    from gateway.policy import AccessPolicy
     from tool_rag.retriever import Retriever
 
 logger = logging.getLogger(__name__)
+
+# Per-session discovered tools: session object → {merged_tool_name: types.Tool}
+# WeakKeyDictionary auto-cleans when the session is GC'd (session ends/times out).
+_session_tools: weakref.WeakKeyDictionary[Any, dict[str, types.Tool]] = weakref.WeakKeyDictionary()
 
 # Name of the always-listed meta-tool that exposes Tool-RAG discovery in-band.
 # Has no "__" so it never collides with a merged {server_id}__{tool} name.
 FIND_TOOLS_NAME = "find_tools"
 
+# Companion meta-tool: executes any tool discovered via find_tools.
+# Always listed alongside find_tools so clients with a static execution registry
+# (e.g. LibreChat) can call discovered tools without needing tools/list_changed support.
+RUN_TOOL_NAME = "run_tool"
+
 # Surfaced to clients at MCP `initialize` so the agent knows the catalog is
 # hidden and how to discover tools. Only set when Tool-RAG (the retriever) is on.
 GATEWAY_INSTRUCTIONS = (
     "This gateway proxies many upstream MCP servers but hides its full tool "
-    "catalog to keep your context small. The only tool listed is "
-    f"`{FIND_TOOLS_NAME}`. To do anything, FIRST call `{FIND_TOOLS_NAME}` with a "
-    "natural-language `query` describing the task; it returns the most relevant "
-    "tools, each with a `call_name` and `input_schema`. THEN call the chosen "
-    "tool directly using its `call_name` (e.g. `serverid__toolname`) with "
-    "arguments matching that schema."
+    "catalog to keep your context small. Two meta-tools are always available: "
+    f"`{FIND_TOOLS_NAME}` (discover tools by query) and `{RUN_TOOL_NAME}` (execute "
+    "a discovered tool). Workflow: FIRST call `find_tools` with a natural-language "
+    "`query`; it returns matching tools with `call_name` and `input_schema`. THEN "
+    f"call `{RUN_TOOL_NAME}` with the chosen `call_name` and `arguments` matching "
+    "that schema."
 )
+
+
+def _clean_schema(schema: Any) -> Any:
+    """Recursively strip 'title' from JSON Schema dicts.
+
+    Pydantic injects 'title' at every level of the schema it generates. Most
+    OpenAI-compatible providers (including OpenRouter) reject tool input schemas
+    that contain 'title' fields, returning 400. Strip them before sending to LLMs.
+    """
+    if isinstance(schema, dict):
+        return {k: _clean_schema(v) for k, v in schema.items() if k != "title"}
+    if isinstance(schema, list):
+        return [_clean_schema(item) for item in schema]
+    return schema
+
+
+def _tool_allowed_by_policy(merged_name: str, policy: "AccessPolicy") -> bool:
+    try:
+        sid, orig = split_merged_name(merged_name)
+    except ValueError:
+        return False
+    return policy.allows_server(sid) and policy.tool_visible(sid, orig)
 
 
 def _err_tool(msg: str) -> types.CallToolResult:
@@ -61,10 +94,10 @@ def _find_tools_definition() -> types.Tool:
         description=(
             "Discover tools available through this gateway. The full catalog is "
             "hidden to save context, so you MUST call this to find a tool before "
-            "you can call it. Describe what you want to accomplish in `query`; "
-            "this returns the most relevant tools with their exact `input_schema` "
-            "and the `call_name` to invoke. Then call the chosen tool directly by "
-            "its `call_name`."
+            "using it. Describe what you want to accomplish in `query`; "
+            "this returns the most relevant tools with their `call_name` and "
+            "`input_schema`. Then execute the chosen tool using `run_tool` with "
+            "its `call_name` and matching arguments."
         ),
         inputSchema={
             "type": "object",
@@ -80,6 +113,33 @@ def _find_tools_definition() -> types.Tool:
                 },
             },
             "required": ["query"],
+        },
+    )
+
+
+def _run_tool_definition() -> types.Tool:
+    """Execution proxy: runs any tool discovered via find_tools."""
+    return types.Tool(
+        name=RUN_TOOL_NAME,
+        description=(
+            "Execute a tool discovered via find_tools. After calling find_tools, "
+            "use this to run a specific tool by its `call_name` with the arguments "
+            "matching its `input_schema`. This is the required execution path for "
+            "tools that are not pre-listed."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "call_name": {
+                    "type": "string",
+                    "description": "The `call_name` returned by find_tools (e.g. `images__fetch_images`).",
+                },
+                "arguments": {
+                    "type": "object",
+                    "description": "Arguments for the tool, matching its `input_schema`.",
+                },
+            },
+            "required": ["call_name"],
         },
     )
 
@@ -135,7 +195,7 @@ def build_gateway_server(registry: Registry, retriever: "Retriever | None" = Non
                 "server": r.server_name,
                 "tool_type": r.tool_type,
                 "description": r.description,
-                "input_schema": r.input_schema,
+                "input_schema": _clean_schema(r.input_schema),
                 "score": r.score,
             })
             if len(results) >= top_k:
@@ -146,11 +206,28 @@ def build_gateway_server(registry: Registry, retriever: "Retriever | None" = Non
             "count": len(results),
             "results": results,
             "instructions": (
-                "To use a tool, call it directly with its `call_name` as the tool "
-                "name and arguments matching its `input_schema`."
+                f"To execute a discovered tool, call `{RUN_TOOL_NAME}` with "
+                '{"call_name": "<call_name>", "arguments": {<args matching input_schema>}}.'
             ),
             "fallback_used": result.fallback_used,
         }
+
+        # Register discovered tools on this session and notify the client so it
+        # re-fetches list_tools() and can call the tools without them having been
+        # in the original list (strict clients like LibreChat require this).
+        try:
+            session = server.request_context.session
+            discovered = _session_tools.setdefault(session, {})
+            for r in results:
+                discovered[r["call_name"]] = types.Tool(
+                    name=r["call_name"],
+                    description=r["description"],
+                    inputSchema=r["input_schema"],
+                )
+            await session.send_tool_list_changed()
+        except Exception:
+            logger.debug("Could not send tools/list_changed", exc_info=True)
+
         return types.CallToolResult(
             content=[types.TextContent(type="text", text=json.dumps(payload))]
         )
@@ -162,9 +239,21 @@ def build_gateway_server(registry: Registry, retriever: "Retriever | None" = Non
         # a non-admin key sees, so any MCP client (not just frameworks that know
         # to POST /tool-rag/retrieve) can find tools. Admin keys see it plus the
         # full catalog. Omitted entirely when Tool-RAG is disabled.
-        base: list[types.Tool] = [_find_tools_definition()] if retriever is not None else []
+        base: list[types.Tool] = (
+            [_find_tools_definition(), _run_tool_definition()] if retriever is not None else []
+        )
         if not policy.admin:
-            return types.ListToolsResult(tools=base)
+            # Include tools discovered via find_tools in this session so strict
+            # MCP clients (e.g. LibreChat) can call them after tools/list_changed.
+            try:
+                session = server.request_context.session
+                extra = [
+                    t for name, t in _session_tools.get(session, {}).items()
+                    if _tool_allowed_by_policy(name, policy)
+                ]
+            except LookupError:
+                extra = []
+            return types.ListToolsResult(tools=base + extra)
         out: list[types.Tool] = list(base)
 
         async def one(server_id: str) -> list[types.Tool]:
@@ -194,11 +283,9 @@ def build_gateway_server(registry: Registry, retriever: "Retriever | None" = Non
             out.extend(part)
         return types.ListToolsResult(tools=out)
 
-    @server.call_tool(validate_input=False)
-    async def handle_call_tool(name: str, arguments: dict[str, Any] | None) -> types.CallToolResult:
+    async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> types.CallToolResult:
+        """Inner dispatch: validate access and call an upstream tool by merged name."""
         policy = get_policy()
-        if name == FIND_TOOLS_NAME:
-            return await handle_find_tools(arguments)
         try:
             server_id, orig = split_merged_name(name)
         except ValueError:
@@ -214,6 +301,25 @@ def build_gateway_server(registry: Registry, retriever: "Retriever | None" = Non
         except Exception as e:
             logger.exception("call_tool upstream error")
             return _err_tool(f"Upstream error: {e}")
+
+    async def handle_run_tool(arguments: dict[str, Any] | None) -> types.CallToolResult:
+        """Execution proxy: runs any tool discovered via find_tools."""
+        args = arguments or {}
+        call_name = args.get("call_name")
+        if not call_name or not isinstance(call_name, str):
+            return _err_tool("run_tool requires a non-empty string `call_name`.")
+        tool_arguments = args.get("arguments") or {}
+        if not isinstance(tool_arguments, dict):
+            return _err_tool("`arguments` must be a JSON object.")
+        return await _dispatch_tool(call_name, tool_arguments)
+
+    @server.call_tool(validate_input=False)
+    async def handle_call_tool(name: str, arguments: dict[str, Any] | None) -> types.CallToolResult:
+        if name == FIND_TOOLS_NAME:
+            return await handle_find_tools(arguments)
+        if name == RUN_TOOL_NAME:
+            return await handle_run_tool(arguments)
+        return await _dispatch_tool(name, arguments)
 
     @server.list_resources()
     async def handle_list_resources(_req: types.ListResourcesRequest) -> types.ListResourcesResult:

@@ -22,6 +22,7 @@ from gateway.server import build_gateway_server
 from gateway.sync_adapter import SyncAdapter
 from gateway.tool_db import ToolDb
 from tool_rag.embedder import create_embedder
+from tool_rag.reranker import create_reranker
 from tool_rag.indexer import ToolRagIndexer
 from tool_rag.retriever import Retriever
 from tool_rag.router import ToolRagRouter
@@ -29,12 +30,18 @@ logger = logging.getLogger(__name__)
 DEFAULT_MCP_PATH = "/mcp"
 
 class APIKeyMiddleware(BaseHTTPMiddleware):
-    """Require Authorization: Bearer <secret> for MCP traffic; skip health and optional tool-rag."""
+    """Require Authorization: Bearer <secret> for MCP traffic; skip health and optional tool-rag.
 
-    def __init__(self, app, key_store, skip_prefixes=("/health",)):
+    When anon_policy is set, unauthenticated requests use that policy instead of returning 401.
+    This allows MCP clients that don't support simple Bearer auth (e.g. LibreChat, which requires
+    full OAuth) to connect without credentials.
+    """
+
+    def __init__(self, app, key_store, skip_prefixes=("/health",), anon_policy=None):
         super().__init__(app)
         self._key_store = key_store
         self._skip_prefixes = skip_prefixes
+        self._anon_policy = anon_policy
 
     async def dispatch(self, request, call_next):
         path = request.url.path
@@ -42,11 +49,26 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         auth = request.headers.get("authorization", "")
         if not auth.startswith("Bearer "):
-            return JSONResponse({"detail": "Missing or invalid Authorization"}, status_code=401)
+            if self._anon_policy is not None:
+                logger.debug("Unauthenticated request, using anon policy key_id=%s", self._anon_policy.key_id)
+                tok = current_policy.set(self._anon_policy)
+                try:
+                    return await call_next(request)
+                finally:
+                    current_policy.reset(tok)
+            return JSONResponse(
+                {"detail": "Missing or invalid Authorization"},
+                status_code=401,
+                headers={"WWW-Authenticate": 'Bearer realm="mcp-gateway"'},
+            )
         token = auth[7:].strip()
         policy = self._key_store.resolve(token)
         if policy is None:
-            return JSONResponse({"detail": "Invalid API key"}, status_code=401)
+            return JSONResponse(
+                {"detail": "Invalid API key"},
+                status_code=401,
+                headers={"WWW-Authenticate": 'Bearer realm="mcp-gateway", error="invalid_token"'},
+            )
         logger.debug("Authenticated key_id=%s", policy.key_id)
         tok = current_policy.set(policy)
         try:
@@ -88,9 +110,9 @@ async def resync_loop(registry, tool_db, indexer, interval):
             logger.exception("Background resync failed")
 
 
-def build_starlette_app(registry, key_store, mcp_path=DEFAULT_MCP_PATH, tool_rag_enabled=False, tool_db=None, tool_rag_router=None, server_health=None, retriever=None):
+def build_starlette_app(registry, key_store, mcp_path=DEFAULT_MCP_PATH, tool_rag_enabled=False, tool_db=None, tool_rag_router=None, server_health=None, retriever=None, anon_policy=None):
     mcp = build_gateway_server(registry, retriever=retriever)
-    session_manager = StreamableHTTPSessionManager(app=mcp, stateless=True, json_response=False)
+    session_manager = StreamableHTTPSessionManager(app=mcp, stateless=False, json_response=False)
     streamable_http_app = StreamableHTTPASGIApp(session_manager)
     is_tr = tool_rag_enabled and tool_rag_router is not None
 
@@ -152,7 +174,7 @@ def build_starlette_app(registry, key_store, mcp_path=DEFAULT_MCP_PATH, tool_rag
             Route("/tool-rag/health", endpoint=tool_rag_router.health, methods=["GET"]),
             Route("/tool-rag/metrics", endpoint=tool_rag_router.metrics, methods=["GET"]),
         ])
-    return Starlette(routes=routes, lifespan=lifespan, middleware=[Middleware(APIKeyMiddleware, key_store=key_store, skip_prefixes=_skip_prefixes())])
+    return Starlette(routes=routes, lifespan=lifespan, middleware=[Middleware(APIKeyMiddleware, key_store=key_store, skip_prefixes=_skip_prefixes(), anon_policy=anon_policy)])
 
 
 def _config_dir():
@@ -177,6 +199,13 @@ def app_from_env():
         tool_db = ToolDb(db_path)
         embedder = create_embedder()
         indexer = ToolRagIndexer(embedder, tool_db)
-        retriever = Retriever(embedder, indexer, tool_db, server_health=server_health)
+        reranker = create_reranker()
+        retriever = Retriever(embedder, indexer, tool_db, server_health=server_health, reranker=reranker)
         tool_rag_router = ToolRagRouter(tool_db, embedder, indexer, retriever, server_health=server_health)
-    return build_starlette_app(registry, key_store, mcp_path=mcp_path, tool_rag_enabled=tool_rag_enabled, tool_db=tool_db, tool_rag_router=tool_rag_router, server_health=server_health, retriever=retriever)
+    anon_key_id = os.environ.get("GATEWAY_ANON_KEY", "").strip()
+    anon_policy = key_store.by_id(anon_key_id) if anon_key_id else None
+    if anon_key_id and anon_policy is None:
+        logger.warning("GATEWAY_ANON_KEY=%r not found in keys.yaml; anonymous access disabled", anon_key_id)
+    elif anon_policy is not None:
+        logger.info("Anonymous access enabled via key_id=%s (GATEWAY_ANON_KEY)", anon_policy.key_id)
+    return build_starlette_app(registry, key_store, mcp_path=mcp_path, tool_rag_enabled=tool_rag_enabled, tool_db=tool_db, tool_rag_router=tool_rag_router, server_health=server_health, retriever=retriever, anon_policy=anon_policy)

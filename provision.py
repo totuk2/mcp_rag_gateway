@@ -121,7 +121,7 @@ def provision_stdio(server_id: str, server_dir: Path, m: dict[str, Any], force: 
 
 
 def provision_docker(
-    server_id: str, server_dir: Path, m: dict[str, Any], force: bool, host_mode: bool
+    server_id: str, server_dir: Path, m: dict[str, Any], host_mode: bool
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     port = m.get("port")
     if not isinstance(port, int):
@@ -130,22 +130,44 @@ def provision_docker(
     if transport not in ("streamable_http", "sse"):
         raise ManifestError(f"{server_dir}: docker transport must be streamable_http or sse")
     path = m.get("path", "/mcp" if transport == "streamable_http" else "/sse")
+    dockerfile_name = str(m.get("dockerfile", "Dockerfile"))
     context = server_dir / str(m.get("build", "."))
-    dockerfile = context / str(m.get("dockerfile", "Dockerfile"))
+    dockerfile = context / dockerfile_name
     if not dockerfile.exists():
         raise ManifestError(f"{server_dir}: no Dockerfile at {dockerfile}")
     tag = f"mcp-server-{server_id}:latest"
 
-    print(f"[{server_id}] building image {tag} ...")
-    build_cmd = ["docker", "build", "-t", tag, "-f", str(dockerfile)]
-    if force:
-        build_cmd.append("--no-cache")
-    build_cmd.append(str(context))
-    run(build_cmd, cwd=ROOT)
-
-    service: dict[str, Any] = {"image": tag, "restart": "unless-stopped"}
+    # The image is built by `docker compose up --build`, not here: provision only
+    # emits the build context into docker-compose.servers.yml. This keeps provision
+    # a pure config generator, so it can itself run in a container with no Docker
+    # socket. `--force` rebuilds are the compose layer's job now (`--no-cache`).
+    print(f"[{server_id}] emitting compose build for image {tag} (built by `compose up --build`) ...")
+    service: dict[str, Any] = {
+        "build": {
+            "context": str(context.relative_to(ROOT)),
+            "dockerfile": dockerfile_name,
+        },
+        "image": tag,
+        "restart": "unless-stopped",
+    }
     if m.get("env"):
+        # Values pass through verbatim, so `${VAR}` / `${VAR:-default}` are
+        # interpolated by `docker compose up` from the root .env (keeps secrets
+        # out of the committed manifest).
         service["environment"] = {str(k): str(v) for k, v in m["env"].items()}
+    if m.get("env_file"):
+        # Per-server env file(s), relative to servers/<id>/, loaded into the
+        # container by compose (e.g. `.env` next to the manifest).
+        raw_files = m["env_file"]
+        files = raw_files if isinstance(raw_files, list) else [raw_files]
+        resolved: list[str] = []
+        for f in files:
+            p = (server_dir / str(f)).resolve()
+            try:
+                resolved.append(str(p.relative_to(ROOT)))
+            except ValueError:
+                raise ManifestError(f"{server_dir}: env_file {f!r} must be inside the repo")
+        service["env_file"] = resolved
     if m.get("command"):
         service["command"] = [str(c) for c in m["command"]]
     if host_mode:
@@ -205,7 +227,7 @@ def main() -> None:
             if kind == "stdio":
                 registry_servers[server_id] = provision_stdio(server_id, server_dir, m, args.force)
             elif kind == "docker":
-                entry, service = provision_docker(server_id, server_dir, m, args.force, args.host)
+                entry, service = provision_docker(server_id, server_dir, m, args.host)
                 registry_servers[server_id] = entry
                 compose_services[server_id] = service
             elif kind == "remote":

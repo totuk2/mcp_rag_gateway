@@ -26,8 +26,12 @@ env:                                         # optional, passed to the subproces
 # transport: streamable_http  # or "sse"
 # path: /mcp                  # MCP path, default /mcp (or /sse for sse)
 # command: ["serve", "--port", "9000"]   # optional container command override
-# env:
-#   API_KEY: changeme
+# env:                        # env vars set inside the container
+#   LOG_LEVEL: info           #   literal value
+#   API_KEY: "${IMAGES_KEY}"  #   interpolated from the root .env by `compose up`
+#                             #   (keeps secrets out of this committed manifest)
+# env_file:                   # optional: env file(s) relative to this dir,
+#   - .env                    #   loaded into the container (servers/<id>/.env is gitignored)
 
 # ── kind: remote ──  already-running server elsewhere; just register its URL.
 # id: my-remote-server
