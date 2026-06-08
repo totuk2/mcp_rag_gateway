@@ -5,6 +5,9 @@ services:
       - "${MCP_GATEWAY_PORT:-8765}:8765"
     volumes:
       - ./config:/app/config:ro
+      # Persist the HuggingFace cache (local embedder + reranker models) so they
+      # download once instead of on every container recreate.
+      - hf-cache:/root/.cache/huggingface
     # All config lives in .env (copy from .env.example). Not required, so the
     # gateway still boots on app defaults if .env is absent.
     env_file:
@@ -29,3 +32,6 @@ services:
     volumes:
       - .:/app
     entrypoint: ["python", "provision.py"]
+
+volumes:
+  hf-cache:
