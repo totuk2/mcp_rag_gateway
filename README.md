@@ -18,7 +18,8 @@ tool catalog so each query surfaces just the relevant tools.
 
 - **Unified MCP endpoint** — one URL, many upstream servers behind auth.
 - **Semantic tool retrieval** — FAISS + sentence-transformers search.
-- **In-band discovery** — non-admin keys see a single `find_tools` meta-tool via `list_tools()`; calling it runs semantic retrieval and returns matching tools + schemas. Works with any MCP client, no out-of-band config.
+- **In-band discovery** — non-admin keys see two meta-tools via `list_tools()`: `find_tools` (semantic retrieval → matching tools + schemas) and `run_tool` (execute any discovered tool). Works with any MCP client, no out-of-band config.
+- **Strict-client support** — after `find_tools`, the gateway registers the discovered tools for that session and emits `tools/list_changed`, so clients that validate calls against the advertised list (e.g. LibreChat) can call them.
 - **Multi-transport** — stdio, SSE, Streamable HTTP upstreams.
 - **Per-key policies** — server + prefix filters per API key.
 - **Agent-friendly provisioning** — add a server from a URL or git repo with one command; an AI agent can follow the [playbook](#agent-playbook-add-a-server-from-a-url-or-repo) end-to-end.
@@ -29,10 +30,10 @@ tool catalog so each query surfaces just the relevant tools.
 ### Design notes & caveats
 
 - **The non-admin lockdown is what keeps context small.** `list_tools()` returns
-  only the `find_tools` meta-tool for non-admin keys (`gateway/server.py`), so a
-  client never loads the full catalog. The agent discovers tools by *calling*
-  `find_tools` (in-band, MCP-native). `call_tool` then works for any allowed tool,
-  by name.
+  only the `find_tools` + `run_tool` meta-tools for non-admin keys
+  (`gateway/server.py`), so a client never loads the full catalog. The agent
+  discovers tools by *calling* `find_tools` (in-band, MCP-native), then executes
+  them via `run_tool` (or by name, for clients that allow unlisted calls).
 - **Both discovery paths are policy-scoped.** `find_tools` and `POST
   /tool-rag/retrieve` both read the caller's `AccessPolicy` and restrict results
   to the key's granted servers + `tool_prefixes`. A body-supplied `allowed_servers`
@@ -43,13 +44,14 @@ tool catalog so each query surfaces just the relevant tools.
   can). `find_tools` is therefore the only discovery path a generic agent can
   reach on its own. The gateway also sets the MCP `initialize` `instructions` field
   telling the agent to call `find_tools` first.
-- **Callability caveat (strict clients).** `find_tools` returns a tool's
-  `call_name`, but that tool was never in `list_tools()`. This gateway's
-  `call_tool` executes any *allowed* tool regardless of listing, so it just works —
-  **provided the client lets the model emit a call to an unlisted name.** Clients
-  that validate calls against the advertised list would reject it; supporting them
-  cleanly needs `tools/list_changed` dynamics (see
-  [roadmap](#roadmap--future-considerations)).
+- **Calling discovered tools.** `find_tools` returns each tool's `call_name`. Two
+  ways to execute it: the `run_tool` meta-tool (always works — it's in
+  `list_tools()`), or a direct call by `call_name`. The direct call works on this
+  gateway (`call_tool` executes any *allowed* tool regardless of listing) **for
+  clients that let the model emit an unlisted name**; for strict clients that
+  validate against the advertised list, `find_tools` registers the discovered
+  tools for the session and emits `tools/list_changed` so they re-fetch and accept
+  the call (`run_tool` sidesteps the issue entirely).
 - **Schemas are returned eagerly.** Both `find_tools` and `/tool-rag/retrieve`
   attach each matched tool's full `input_schema` in the same response — there is
   no separate "describe tool" call (`tool_rag/router.py:76-93`). This favours
@@ -412,20 +414,24 @@ export them in your shell instead. All variables are optional — defaults below
 
 ### LibreChat
 
-Point an MCP server at `http://gateway:8765/mcp` with a **non-admin** token. The
-Deferred Tools flow discovers tools through `/tool-rag/retrieve` at runtime
-instead of loading the full catalog.
+Point an MCP server at `http://gateway:8765/mcp` with a **non-admin** token.
+Discovery is in-band: `list_tools()` exposes only `find_tools` + `run_tool`, and
+after `find_tools` the gateway emits `tools/list_changed` so LibreChat picks up
+and calls the discovered tools — no full catalog loaded. (The Deferred Tools flow
+can also call `POST /tool-rag/retrieve` directly; it's policy-scoped the same way.)
 
 ### Generic MCP clients (in-band)
 
-Connect to `/mcp` with a **non-admin** token. `list_tools()` returns a single
-`find_tools` tool (and the `initialize` instructions explain it). The agent:
+Connect to `/mcp` with a **non-admin** token. `list_tools()` returns the
+`find_tools` + `run_tool` meta-tools (and the `initialize` instructions explain
+them). The agent:
 
 1. Calls `find_tools` with `{"query": "<what you want to do>"}` (optional `top_k`).
 2. Reads the returned `results` — each has a `call_name`, `description`, and full
    `input_schema`.
-3. Calls the chosen tool directly via `/mcp` using its `call_name`
-   (the merged `server_id__tool` name).
+3. Executes the chosen tool with `run_tool` (`{"call_name": "<server__tool>",
+   "arguments": {...}}`) — or calls the `call_name` directly if the client allows
+   unlisted names.
 
 No out-of-band knowledge of `/tool-rag/*` is required — discovery is fully in the
 MCP protocol. (Frameworks may still call `POST /tool-rag/retrieve` directly; it
@@ -456,6 +462,7 @@ tool_rag/
   embedder.py           text -> vector (local sentence-transformers or remote API)
   indexer.py            FAISS index (IndexIDMap(IndexFlatIP), removable vectors)
   ranker.py             scoring
+  reranker.py           optional cross-encoder rerank stage
   retriever.py          query -> top-K pipeline
   router.py             /tool-rag/* route handlers
 servers/
@@ -468,15 +475,6 @@ config/
 ---
 
 ## Roadmap / future considerations
-
-**Dynamic tool listing for strict clients.** `find_tools` makes discovery
-in-band, but the tools it surfaces are not in `list_tools()`, so clients that
-validate `tools/call` against the advertised list will reject them (see the
-callability caveat above). A future option: after `find_tools`, emit
-`notifications/tools/list_changed` and surface the discovered tools per session
-so strict clients re-fetch and accept the call. Harder here because upstream
-sessions are stateless/per-request — there is no per-connection tool set to
-mutate today.
 
 **Two-phase (lazy) tool discovery.** Today both `find_tools` and `retrieve`
 return full schemas eagerly (see [Design notes & caveats](#design-notes--caveats)).
