@@ -1,6 +1,13 @@
 services:
   mcp-gateway:
-    build: .
+    build:
+      context: .
+      args:
+        # Interpolated from .env. When TOOL_RAG_RERANKER=local, the Dockerfile
+        # bakes the reranker model into the image (warm at boot, no runtime HF
+        # fetch). Otherwise the build skips it.
+        TOOL_RAG_RERANKER: ${TOOL_RAG_RERANKER:-off}
+        TOOL_RAG_RERANKER_MODEL: ${TOOL_RAG_RERANKER_MODEL:-cross-encoder/mmarco-mMiniLMv2-L12-H384-v1}
     ports:
       - "${MCP_GATEWAY_PORT:-8765}:8765"
     volumes:

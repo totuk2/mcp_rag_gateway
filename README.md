@@ -309,7 +309,9 @@ precision when surface tokens mislead the bi-encoder (e.g. an image tool that
 mentions `http://` outranking a docs tool for a "Streamable HTTP" query). It
 runs only on the FAISS shortlist (bounded to 50 candidates), so cost stays fixed
 at catalog scale. Default off (no extra model download). Pairs naturally with a
-stronger multilingual `url` embedder.
+stronger multilingual `url` embedder. When `TOOL_RAG_RERANKER=local`, `docker
+compose build` bakes the model into the image (warm at boot, no runtime HF fetch);
+the `hf-cache` volume otherwise downloads it lazily on first use and persists it.
 
 ### Startup, refresh, and liveness
 
