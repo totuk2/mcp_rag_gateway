@@ -483,13 +483,17 @@ def build_gateway_server(
         return await _dispatch_tool(call_name, tool_arguments)
 
     def _result_to_json(res: types.CallToolResult) -> dict[str, Any]:
-        """Flatten a CallToolResult into a JSON-able summary for run_tools."""
-        texts = [c.text for c in res.content if isinstance(c, types.TextContent)]
+        """Flatten a CallToolResult into a JSON-able summary for run_tools. On
+        failure always populate `error` so callers see one consistent shape."""
+        texts = "\n".join(c.text for c in res.content if isinstance(c, types.TextContent))
         out: dict[str, Any] = {"ok": not res.isError}
+        if res.isError:
+            out["error"] = texts or "tool returned an error"
+            return out
         if res.structuredContent is not None:
             out["structured"] = res.structuredContent
         if texts:
-            out["text"] = "\n".join(texts)
+            out["text"] = texts
         non_text = [c.type for c in res.content if not isinstance(c, types.TextContent)]
         if non_text:
             out["content_types"] = non_text
@@ -592,7 +596,12 @@ def build_gateway_server(
             logger.exception("planner error")
             return _err_tool(f"Planner error: {e}")
         payload = {"query": query, **plan,
-                   "instructions": f"Fill in arguments and execute each group via `{RUN_TOOLS_NAME}`."}
+                   "instructions": (
+                       f"Each step lists its `args`/`required`; for the exact input_schema "
+                       f"call `{DESCRIBE_TOOL_NAME}` with the step's `call_name`. Fill in "
+                       f"`arguments` against the schema, then execute each `group` (steps "
+                       f"sharing a group have no inter-dependencies) via `{RUN_TOOLS_NAME}`."
+                   )}
         return types.CallToolResult(
             content=[types.TextContent(type="text", text=json.dumps(payload))]
         )

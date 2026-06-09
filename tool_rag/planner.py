@@ -147,6 +147,13 @@ def _normalize_plan(
     tool_type/server so the caller can see which steps are writes."""
     type_by_name = {c["call_name"]: c.get("tool_type") for c in candidates}
     server_by_name = {c["call_name"]: c.get("server") for c in candidates}
+    # Carry each tool's arg names/required into the step so the client can fill
+    # arguments without guessing (the authoritative full schema is one
+    # describe_tool call away). Cheap — we already hold the candidate schemas.
+    spec_by_name: dict[str, dict[str, Any]] = {}
+    for c in candidates:
+        compact = _compact_tool(c)
+        spec_by_name[c["call_name"]] = {"args": compact["args"], "required": compact["required"]}
     steps_raw = raw.get("steps")
     steps_in = steps_raw if isinstance(steps_raw, list) else []
     missing_raw = raw.get("missing")
@@ -160,11 +167,14 @@ def _normalize_plan(
             if call_name:
                 missing.append(f"unknown tool referenced: {call_name}")
             continue
+        spec = spec_by_name.get(call_name, {"args": [], "required": []})
         steps_out.append({
             "id": s.get("id") or f"s{i}",
             "call_name": call_name,
             "server": server_by_name.get(call_name),
             "tool_type": type_by_name.get(call_name),
+            "args": spec["args"],
+            "required": spec["required"],
             "arguments_hint": s.get("arguments_hint") or {},
             "depends_on": s.get("depends_on") if isinstance(s.get("depends_on"), list) else [],
             "group": s.get("group") if isinstance(s.get("group"), int) else 0,
