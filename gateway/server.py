@@ -606,8 +606,15 @@ def build_gateway_server(
             content=[types.TextContent(type="text", text=json.dumps(payload))]
         )
 
+    _META_TOOL_NAMES = {
+        FIND_TOOLS_NAME, RUN_TOOL_NAME, RUN_TOOLS_NAME, DESCRIBE_TOOL_NAME, PLAN_TOOL_NAME,
+    }
+
     @server.call_tool(validate_input=False)
     async def handle_call_tool(name: str, arguments: dict[str, Any] | None) -> types.CallToolResult:
+        # One line per call so logs show which meta-tool (or upstream tool) ran —
+        # CallToolRequest alone is generic. Keeps find_tools/run_tools/plan visible.
+        logger.info("call_tool: %s (%s)", name, "meta" if name in _META_TOOL_NAMES else "upstream")
         if name == FIND_TOOLS_NAME:
             return await handle_find_tools(arguments)
         if name == RUN_TOOL_NAME:
