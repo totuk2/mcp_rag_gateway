@@ -23,6 +23,7 @@ from gateway.sync_adapter import SyncAdapter
 from gateway.tool_db import ToolDb
 from tool_rag.embedder import create_embedder
 from tool_rag.reranker import create_reranker
+from tool_rag.planner import create_planner
 from tool_rag.indexer import ToolRagIndexer
 from tool_rag.retriever import Retriever
 from tool_rag.router import ToolRagRouter
@@ -110,8 +111,8 @@ async def resync_loop(registry, tool_db, indexer, interval):
             logger.exception("Background resync failed")
 
 
-def build_starlette_app(registry, key_store, mcp_path=DEFAULT_MCP_PATH, tool_rag_enabled=False, tool_db=None, tool_rag_router=None, server_health=None, retriever=None, anon_policy=None):
-    mcp = build_gateway_server(registry, retriever=retriever)
+def build_starlette_app(registry, key_store, mcp_path=DEFAULT_MCP_PATH, tool_rag_enabled=False, tool_db=None, tool_rag_router=None, server_health=None, retriever=None, anon_policy=None, planner=None, max_parallel=8):
+    mcp = build_gateway_server(registry, retriever=retriever, planner=planner, max_parallel=max_parallel)
     session_manager = StreamableHTTPSessionManager(app=mcp, stateless=False, json_response=False)
     streamable_http_app = StreamableHTTPASGIApp(session_manager)
     is_tr = tool_rag_enabled and tool_rag_router is not None
@@ -173,6 +174,7 @@ def build_starlette_app(registry, key_store, mcp_path=DEFAULT_MCP_PATH, tool_rag
             Route("/tool-rag/reindex", endpoint=tool_rag_router.reindex, methods=["POST"]),
             Route("/tool-rag/health", endpoint=tool_rag_router.health, methods=["GET"]),
             Route("/tool-rag/metrics", endpoint=tool_rag_router.metrics, methods=["GET"]),
+            Route("/tool-rag/tool/{tool_id:path}", endpoint=tool_rag_router.describe, methods=["GET"]),
         ])
     return Starlette(routes=routes, lifespan=lifespan, middleware=[Middleware(APIKeyMiddleware, key_store=key_store, skip_prefixes=_skip_prefixes(), anon_policy=anon_policy)])
 
@@ -193,6 +195,11 @@ def app_from_env():
     tool_db = None
     tool_rag_router = None
     retriever = None
+    planner = None
+    try:
+        max_parallel = int(os.environ.get("TOOL_RAG_MAX_PARALLEL", "8"))
+    except ValueError:
+        max_parallel = 8
     server_health = ServerHealth(registry)
     if tool_rag_enabled:
         db_path = os.environ.get("TOOL_RAG_DB", "tool_registry.db")
@@ -200,6 +207,7 @@ def app_from_env():
         embedder = create_embedder()
         indexer = ToolRagIndexer(embedder, tool_db)
         reranker = create_reranker()
+        planner = create_planner()
         retriever = Retriever(embedder, indexer, tool_db, server_health=server_health, reranker=reranker)
         tool_rag_router = ToolRagRouter(tool_db, embedder, indexer, retriever, server_health=server_health)
     anon_key_id = os.environ.get("GATEWAY_ANON_KEY", "").strip()
@@ -208,4 +216,4 @@ def app_from_env():
         logger.warning("GATEWAY_ANON_KEY=%r not found in keys.yaml; anonymous access disabled", anon_key_id)
     elif anon_policy is not None:
         logger.info("Anonymous access enabled via key_id=%s (GATEWAY_ANON_KEY)", anon_policy.key_id)
-    return build_starlette_app(registry, key_store, mcp_path=mcp_path, tool_rag_enabled=tool_rag_enabled, tool_db=tool_db, tool_rag_router=tool_rag_router, server_health=server_health, retriever=retriever, anon_policy=anon_policy)
+    return build_starlette_app(registry, key_store, mcp_path=mcp_path, tool_rag_enabled=tool_rag_enabled, tool_db=tool_db, tool_rag_router=tool_rag_router, server_health=server_health, retriever=retriever, anon_policy=anon_policy, planner=planner, max_parallel=max_parallel)

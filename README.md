@@ -52,16 +52,16 @@ tool catalog so each query surfaces just the relevant tools.
   validate against the advertised list, `find_tools` registers the discovered
   tools for the session and emits `tools/list_changed` so they re-fetch and accept
   the call (`run_tool` sidesteps the issue entirely).
-- **Schemas are returned eagerly.** Both `find_tools` and `/tool-rag/retrieve`
-  attach each matched tool's full `input_schema` in the same response — there is
-  no separate "describe tool" call (`tool_rag/router.py:76-93`). This favours
-  **call reliability** (the exact schema is in context when the model builds
-  arguments) at some cost to context savings.
-- **Context savings today = "catalog → top-K," not "names-only shortlist + lazy
-  schema fetch."** Because each returned tool carries its full schema, a retrieve
-  of many tools can still be heavy. The savings scale with **selectivity**:
-  retrieve many, call few. A lighter two-phase discovery is on the
-  [roadmap](#roadmap--future-considerations).
+- **Schemas are eager by default, lazy on request.** By default `find_tools` and
+  `/tool-rag/retrieve` attach each matched tool's full `input_schema` in the same
+  response — favouring **call reliability** (the exact schema is in context when
+  the model builds arguments). Pass `include_schema=false` for a lighter
+  names+description shortlist and fetch a chosen tool's schema on demand via
+  `describe_tool` / `GET /tool-rag/tool/<id>` (see [Meta-tools](#meta-tools-in-band-orchestration)).
+- **Context savings scale with selectivity.** In eager mode each returned tool
+  carries its full schema, so a broad retrieve can still be heavy — retrieve many,
+  call few. Lazy mode (`include_schema=false` → `describe_tool`) compresses the
+  discovery step further at catalog scale, at the cost of an extra round-trip.
 
 ---
 
@@ -316,6 +316,37 @@ stronger multilingual `url` embedder. When `TOOL_RAG_RERANKER=local`, `docker
 compose build` bakes the model into the image (warm at boot, no runtime HF fetch);
 the `hf-cache` volume otherwise downloads it lazily on first use and persists it.
 
+### Meta-tools (in-band orchestration)
+
+Non-admin keys see a small set of meta-tools instead of the full catalog. All are
+policy-scoped and self-hosted (no third party in the loop):
+
+- **`find_tools`** `{query, top_k?, include_schema?}` — semantic discovery. Returns
+  matching tools with `call_name` (+ `input_schema` unless `include_schema=false`).
+- **`run_tool`** `{call_name, arguments}` — execute one discovered tool.
+- **`run_tools`** `{calls: [{call_name, arguments, id?}], max_concurrency?}` — execute
+  several **in parallel** in one call. Per-call error isolation (one failure doesn't
+  abort the batch); concurrency bounded by `TOOL_RAG_MAX_PARALLEL`.
+- **`describe_tool`** `{call_name}` — fetch one tool's full `input_schema` on demand
+  (the second phase of lazy discovery). Also registers the tool for strict clients
+  via `tools/list_changed`.
+- **`plan`** `{query, top_k?}` — *only listed when `TOOL_RAG_PLANNER=llm`.* Discovers
+  candidates and asks a configurable own/OpenAI-shaped LLM (e.g. your Ollama) for a
+  structured multi-step plan: `{steps: [{id, call_name, arguments_hint, depends_on,
+  group, tool_type}], notes, missing}`. **Advisory only** — it never executes; the
+  client fills concrete arguments and runs each `group` via `run_tools`.
+
+**Two-phase (lazy) schema.** Default is eager (`find_tools` returns full schemas) for
+call reliability. For maximum context savings, call `find_tools(..., include_schema=false)`
+for a names+descriptions shortlist, then `describe_tool(call_name)` (or
+`GET /tool-rag/tool/<id>`) for the schema of the tool you actually chose.
+
+**Two-model topology (planner).** The client model (LibreChat's) drives the loop,
+fills arguments, and sequences calls; the planner model (gateway-side) only produces
+the plan. The planner is a bounded JSON task — a 7B–14B instruct model with JSON mode
+suffices, and should be ≥ the client model's planning ability. Enable `plan` when the
+client model is the weak link; a strong client plans fine from `find_tools` alone.
+
 ### Startup, refresh, and liveness
 
 - **Clean rebuild on startup.** `TOOL_RAG_STARTUP_REINDEX=full` (default) rebuilds
@@ -368,6 +399,15 @@ is intersected with the key's granted servers (it can only narrow, never
 broaden), and per-server `tool_prefixes` are applied. Scoping is skipped only
 under `TOOL_RAG_WITHOUT_AUTH=1`.
 
+Pass `"include_schema": false` to get a lighter shortlist without `input_schema`;
+fetch a chosen tool's schema with `GET /tool-rag/tool/<tool_id>`.
+
+#### `GET /tool-rag/tool/{tool_id}`
+
+On-demand schema fetch (lazy two-phase). Returns `{tool_id, tool_name, server_name,
+description, tool_type, input_schema, status}`. Policy-scoped: the tool's server must
+be granted and visible to the key.
+
 #### `POST /tool-rag/reindex`
 
 Body `{"mode": "full"}` (rebuild) or `{"mode": "incremental"}` (dirty tools only).
@@ -405,6 +445,12 @@ export them in your shell instead. All variables are optional — defaults below
 | `TOOL_RAG_EMBED_DIM`           | —                        | Embedding dimension for the `url` embedder (e.g. `1024` for Qwen3-0.6B). If unset it is probed once at startup (requires the endpoint reachable at boot) |
 | `TOOL_RAG_RERANKER`            | `off`                    | `off` or `local` — cross-encoder reranking of FAISS candidates |
 | `TOOL_RAG_RERANKER_MODEL`      | `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` | Cross-encoder model (small, multilingual, 14 languages) |
+| `TOOL_RAG_MAX_PARALLEL`        | `8`                      | Cap on concurrent `run_tools` upstream calls |
+| `TOOL_RAG_PLANNER`             | `off`                    | `off` or `llm` — enable the LLM-backed `plan` meta-tool |
+| `TOOL_RAG_PLANNER_URL`         | —                        | Chat-completions endpoint for the planner (e.g. `http://ollama:11434/v1/chat/completions`) |
+| `TOOL_RAG_PLANNER_MODEL`       | —                        | Planner model (e.g. `qwen2.5:14b-instruct`) |
+| `TOOL_RAG_PLANNER_API_KEY`     | —                        | Optional bearer for the planner endpoint |
+| `TOOL_RAG_PLANNER_TEMPERATURE` | `0.1`                    | Planner sampling temperature |
 | `TOOL_RAG_DB`                  | `tool_registry.db`       | SQLite path                      |
 | `TOOL_RAG_WITHOUT_AUTH`        | `0`                      | Skip auth for `/tool-rag/`       |
 | `TOOL_RAG_STARTUP_REINDEX`     | `full`                   | `full` \| `incremental` \| `off` — index strategy at startup |
@@ -468,6 +514,7 @@ tool_rag/
   indexer.py            FAISS index (IndexIDMap(IndexFlatIP), removable vectors)
   ranker.py             scoring
   reranker.py           optional cross-encoder rerank stage
+  planner.py            optional LLM-backed plan meta-tool (off by default)
   retriever.py          query -> top-K pipeline
   router.py             /tool-rag/* route handlers
 servers/
@@ -481,28 +528,30 @@ config/
 
 ## Roadmap / future considerations
 
-**Two-phase (lazy) tool discovery.** Today both `find_tools` and `retrieve`
-return full schemas eagerly (see [Design notes & caveats](#design-notes--caveats)).
-A lazy flow would compress context further at catalog scale:
+**Optional Rube hybrid fallback (privacy trade-off).** Composio's hosted
+[Rube](https://rube.app) is itself an MCP server, so you can register it as a
+`remote` upstream (`kind: remote, url: https://rube.app/mcp, headers: {Authorization:
+"${RUBE_TOKEN}"}`) and its tools surface through `find_tools` like any other server —
+a "private-first, fall back to Rube for SaaS apps you haven't self-integrated" hybrid.
+**Caveat:** that traffic goes to Composio and Composio brokers the OAuth, which cuts
+against this gateway's self-hosting/traffic-ownership goal — so it's opt-in, not a
+default. A future enhancement could auto-suggest Rube's search tool only when local
+retrieval scores fall below a threshold (`TOOL_RAG_RUBE_FALLBACK`, off by default).
 
-- **Optional schemas on `retrieve`** — e.g. `include_schema=false` to return a
-  cheap names + description shortlist for discovery.
-- **A per-tool `describe` / `get-schema` endpoint** — fetch the exact
-  `input_schema` on demand, only for the tool the agent actually chose.
-
-This is the original design intent (discover cheaply → fetch schema → call), and
-it maximises context savings. The trade-off:
+**Two-phase (lazy) tool discovery — shipped as opt-in.** Lazy discovery now exists:
+`find_tools(..., include_schema=false)` (or `POST /tool-rag/retrieve` with the same
+flag) returns a cheap names+description shortlist, and `describe_tool` /
+`GET /tool-rag/tool/<id>` fetch the exact `input_schema` on demand. The trade-off:
 
 | | Context savings | Call reliability |
 |---|---|---|
-| **Eager (current)** | weaker — pays for unused schemas | strong — schema always in context |
-| **Lazy (two-phase)** | strong at scale / high selectivity | reliable **only** if the loop enforces fetch-before-call |
+| **Eager (default)** | weaker — pays for unused schemas | strong — schema always in context |
+| **Lazy (opt-in)** | strong at scale / high selectivity | reliable **only** if the loop enforces fetch-before-call |
 
-**Requirement before switching the default:** lazy mode is only as reliable as
-the agent loop's enforcement that a tool's schema is fetched *before* it may be
-called (the way Deferred-Tools / ToolSearch gating works). Until that guardrail
-exists in the client integration, **eager stays the default**; the optional
-`include_schema=false` + `describe` endpoint can ship first as an opt-in.
+**Eager stays the default** because lazy mode is only as reliable as the agent loop's
+enforcement that a schema is fetched *before* the tool is called (the way
+Deferred-Tools / ToolSearch gating works). Flip to lazy per call when your client
+enforces that.
 
 ---
 

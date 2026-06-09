@@ -70,6 +70,11 @@ class Retriever:
         self._server_health = server_health
         self._reranker = reranker
 
+    def get_tool(self, tool_id: str) -> ToolRecord | None:
+        """Fetch a single tool record by its id (== merged call_name). O(1) PK
+        lookup; used by the describe_tool lazy-schema path."""
+        return self._tool_db.get_tool(tool_id)
+
     async def retrieve(
         self,
         query: str,
