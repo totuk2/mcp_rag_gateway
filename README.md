@@ -52,16 +52,16 @@ tool catalog so each query surfaces just the relevant tools.
   validate against the advertised list, `find_tools` registers the discovered
   tools for the session and emits `tools/list_changed` so they re-fetch and accept
   the call (`run_tool` sidesteps the issue entirely).
-- **Schemas are returned eagerly.** Both `find_tools` and `/tool-rag/retrieve`
-  attach each matched tool's full `input_schema` in the same response — there is
-  no separate "describe tool" call (`tool_rag/router.py:76-93`). This favours
-  **call reliability** (the exact schema is in context when the model builds
-  arguments) at some cost to context savings.
-- **Context savings today = "catalog → top-K," not "names-only shortlist + lazy
-  schema fetch."** Because each returned tool carries its full schema, a retrieve
-  of many tools can still be heavy. The savings scale with **selectivity**:
-  retrieve many, call few. A lighter two-phase discovery is on the
-  [roadmap](#roadmap--future-considerations).
+- **Schemas are eager by default, lazy on request.** By default `find_tools` and
+  `/tool-rag/retrieve` attach each matched tool's full `input_schema` in the same
+  response — favouring **call reliability** (the exact schema is in context when
+  the model builds arguments). Pass `include_schema=false` for a lighter
+  names+description shortlist and fetch a chosen tool's schema on demand via
+  `describe_tool` / `GET /tool-rag/tool/<id>` (see [Meta-tools](#meta-tools-in-band-orchestration)).
+- **Context savings scale with selectivity.** In eager mode each returned tool
+  carries its full schema, so a broad retrieve can still be heavy — retrieve many,
+  call few. Lazy mode (`include_schema=false` → `describe_tool`) compresses the
+  discovery step further at catalog scale, at the cost of an extra round-trip.
 
 ---
 
