@@ -63,6 +63,9 @@ class ToolRagRouter:
 
         top_k = int(body.get("top_k", 5))
         body_servers = body.get("allowed_servers")
+        include_schema = body.get("include_schema", True)
+        if not isinstance(include_schema, bool):
+            include_schema = True
         permission_scope = body.get("permission_scope")
         raw_type = body.get("tool_type")
         tool_type: ToolType | None = raw_type if raw_type in ("read", "write", "admin", "action", "query") else None
@@ -105,17 +108,19 @@ class ToolRagRouter:
                     continue
                 if not policy.tool_visible(sid, orig):
                     continue  # honour per-key tool_prefixes allowlists
-            results.append({
+            entry = {
                 "tool_id": r.tool_id,
                 "tool_name": r.tool_name,
                 "server_name": r.server_name,
                 "score": r.score,
                 "reason": r.reason,
                 "description": r.description,
-                "input_schema": r.input_schema,
                 "status": r.status,
                 "tool_type": r.tool_type,
-            })
+            }
+            if include_schema:
+                entry["input_schema"] = r.input_schema
+            results.append(entry)
             if len(results) >= top_k:
                 break
 
@@ -123,6 +128,37 @@ class ToolRagRouter:
             "query": result.query,
             "results": results,
             "fallback_used": result.fallback_used,
+            "include_schema": include_schema,
+        })
+
+    # ------------------------------------------------------------------
+    # GET /tool-rag/tool/{tool_id}  —  on-demand schema fetch (lazy two-phase)
+    # ------------------------------------------------------------------
+
+    async def describe(self, request: Request) -> JSONResponse:
+        tool_id = request.path_params.get("tool_id", "")
+        if not tool_id:
+            return JSONResponse({"detail": "tool_id is required"}, status_code=400)
+        # Policy-scope: when auth is on, the tool's server must be granted + visible.
+        policy = current_policy.get()
+        if policy is not None:
+            try:
+                sid, orig = split_merged_name(tool_id)
+            except ValueError:
+                return JSONResponse({"detail": "invalid tool_id"}, status_code=400)
+            if not (policy.allows_server(sid) and policy.tool_visible(sid, orig)):
+                return JSONResponse({"detail": "access denied for this tool"}, status_code=403)
+        rec = self._tool_db.get_tool(tool_id)
+        if rec is None:
+            return JSONResponse({"detail": f"unknown tool {tool_id}"}, status_code=404)
+        return JSONResponse({
+            "tool_id": rec.tool_id,
+            "tool_name": rec.tool_name,
+            "server_name": rec.server_name,
+            "description": rec.description,
+            "tool_type": rec.tool_type,
+            "input_schema": rec.input_schema,
+            "status": rec.status,
         })
 
     # ------------------------------------------------------------------
