@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import weakref
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
@@ -60,6 +61,38 @@ PLAN_TOOL_NAME = "plan"
 # Default cap on concurrent upstream calls in run_tools (overridable per call and
 # via TOOL_RAG_MAX_PARALLEL). Bounds stdio subprocess spawns / upstream load.
 DEFAULT_MAX_PARALLEL = 8
+
+# Default cap (chars) on the *teaser* description returned in the find_tools
+# shortlist. Long upstream descriptions (e.g. arxiv search_papers' ~50 lines of
+# query-construction guidance) bloat the agent's context for no selection benefit;
+# the full text stays in describe_tool + the embedding. 0 = no truncation.
+DEFAULT_SHORTLIST_DESC_CHARS = 300
+
+
+def _shortlist_description(text: str) -> str:
+    """Truncate a tool description to a short teaser for the find_tools shortlist.
+
+    Presentational only (call-time; no reindex). Prefers the first paragraph — for
+    front-loaded descriptions this is the summary sentence — then falls back to a
+    sentence boundary, then a hard cap. Cap from TOOL_RAG_SHORTLIST_DESC_CHARS
+    (0 disables). describe_tool still serves the full description on demand."""
+    text = (text or "").strip()
+    try:
+        cap = int(os.environ.get("TOOL_RAG_SHORTLIST_DESC_CHARS", DEFAULT_SHORTLIST_DESC_CHARS))
+    except (TypeError, ValueError):
+        cap = DEFAULT_SHORTLIST_DESC_CHARS
+    if cap <= 0 or len(text) <= cap:
+        return text
+    # First paragraph (e.g. arxiv: the lead summary sentence) if it fits.
+    para = text.split("\n\n", 1)[0].strip()
+    if len(para) <= cap:
+        return para
+    # Otherwise cut at the last sentence boundary that isn't too aggressive.
+    cut = para[:cap]
+    dot = cut.rfind(". ")
+    if dot >= cap // 2:
+        return cut[: dot + 1]
+    return cut.rstrip() + "…"
 
 
 def _gateway_instructions(planner_on: bool) -> str:
@@ -365,6 +398,12 @@ def build_gateway_server(
             )
 
         results, fallback_used = await _gather_candidates(query, top_k)
+
+        # Advertise a short teaser description on the shortlist (full text stays in
+        # describe_tool + the embedding). Done here, not in _gather_candidates, so
+        # the planner's candidate input is untouched.
+        for r in results:
+            r["description"] = _shortlist_description(r["description"])
 
         # Register tools for the session so strict clients can call them. In lazy
         # mode register a placeholder schema; describe_tool fills it in later.

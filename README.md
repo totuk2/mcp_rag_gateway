@@ -443,6 +443,7 @@ export them in your shell instead. All variables are optional — defaults below
 | `TOOL_RAG_EMBED_MODEL`         | `text-embedding-3-small` | Model name sent to the embeddings API (set to your Ollama tag, e.g. `hf.co/Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0`) |
 | `TOOL_RAG_EMBED_API_KEY`       | —                        | Bearer token for the embeddings API (optional; omit for keyless Ollama) |
 | `TOOL_RAG_EMBED_DIM`           | —                        | Embedding dimension for the `url` embedder (e.g. `1024` for Qwen3-0.6B). If unset it is probed once at startup (requires the endpoint reachable at boot) |
+| `TOOL_RAG_EMBED_QUERY_INSTRUCTION` | —                    | Asymmetric-model query prefix: queries are wrapped `Instruct: <this>\nQuery: <q>` (documents embedded raw). Set for instruction-tuned embedders like Qwen3-Embedding; leave empty for symmetric models (MiniLM). Query-side only — no reindex |
 | `TOOL_RAG_RERANKER`            | `off`                    | `off` or `local` — cross-encoder reranking of FAISS candidates |
 | `TOOL_RAG_RERANKER_MODEL`      | `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` | Cross-encoder model (small, multilingual, 14 languages) |
 | `TOOL_RAG_MAX_PARALLEL`        | `8`                      | Cap on concurrent `run_tools` upstream calls |
@@ -457,6 +458,7 @@ export them in your shell instead. All variables are optional — defaults below
 | `TOOL_RAG_HEALTHCHECK_INTERVAL`| `30`                     | Seconds between upstream liveness probes; `0` disables |
 | `TOOL_RAG_HEALTHCHECK_TIMEOUT` | `5`                      | Per-probe connect timeout (seconds) |
 | `TOOL_RAG_RESYNC_INTERVAL`     | `0`                      | Seconds between background re-pull of upstream tool lists; `0` = off |
+| `TOOL_RAG_SHORTLIST_DESC_CHARS`| `300`                    | Cap (chars) on the teaser description in the `find_tools` shortlist; `0` = full text. Full description always available via `describe_tool` and used for embedding (no reindex) |
 | `UVICORN_LOG_LEVEL`            | `info`                   | Uvicorn log level                |
 
 ---

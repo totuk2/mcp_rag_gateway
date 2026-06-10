@@ -55,6 +55,19 @@ class Embedder(ABC):
         """Stable identity of the model+endpoint, persisted with the index so a
         model change (even at the same dimension) forces a clean rebuild."""
 
+    def embed_query(self, query: str) -> list[float]:
+        """Embed a *query* (asymmetric retrieval). Instruction-tuned models like
+        Qwen3-Embedding expect queries wrapped as `Instruct: <task>\\nQuery: <q>`
+        while documents are embedded raw; set TOOL_RAG_EMBED_QUERY_INSTRUCTION to
+        the task description to enable this. Query-side only — documents are still
+        embedded via embed()/embed_many(), so changing it needs no reindex. Empty
+        (the default) leaves the query untouched, which is correct for symmetric
+        models like all-MiniLM."""
+        instruction = os.environ.get("TOOL_RAG_EMBED_QUERY_INSTRUCTION", "").strip()
+        if instruction:
+            query = f"Instruct: {instruction}\nQuery: {query}"
+        return self.embed(query)
+
 
 class LocalEmbedder(Embedder):
     """sentence-transformers local embedder (all-MiniLM-L6-v2 → 384 dims)."""
