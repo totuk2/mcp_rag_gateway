@@ -1,3 +1,5 @@
+include:
+  - docker-compose.servers.yml
 services:
   mcp-gateway:
     build:
@@ -24,7 +26,9 @@ services:
       # Fixed in-container path (tied to the volume mount above) — pinned here so
       # it can't be overridden by an errant .env value.
       MCP_GATEWAY_CONFIG_DIR: /app/config
-
+    depends_on:
+      - arxiv
+      
   # One-shot provisioner: turns servers/*/manifest.yaml into
   # config/registry.generated.yaml + docker-compose.servers.yml. Reuses the
   # gateway image (PyYAML is already installed) and mounts the repo so the

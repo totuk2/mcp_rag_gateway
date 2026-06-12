@@ -84,8 +84,8 @@ class Retriever:
         tool_type: ToolType | None = None,
     ) -> RetrievalResult:
         """Run the full retrieval pipeline."""
-        # 1. Embed
-        query_vec = self._embedder.embed(query)
+        # 1. Embed (query-side instruction prefix applied for asymmetric models)
+        query_vec = self._embedder.embed_query(query)
 
         # 2. FAISS search. With a reranker, widen first-stage recall (the
         # cross-encoder can only reorder what FAISS returns) but bound the pool
