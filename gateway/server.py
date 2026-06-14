@@ -68,6 +68,36 @@ DEFAULT_MAX_PARALLEL = 8
 # the full text stays in describe_tool + the embedding. 0 = no truncation.
 DEFAULT_SHORTLIST_DESC_CHARS = 300
 
+# plan multi-intent candidate gathering (decompose -> retrieve per intent -> union).
+# See docs/superpowers/specs/2026-06-14-plan-multi-intent-candidates-design.md.
+DEFAULT_PLAN_MAX_INTENTS = 6        # max sub-intents kept from decomposition
+DEFAULT_PLAN_PER_INTENT_K = 5       # retrieval depth per intent (and per base query)
+DEFAULT_PLAN_TOP_K = 30             # default union cap (the plan `top_k` arg)
+
+
+def _union_candidates(
+    lists: list[list[dict[str, Any]]], cap: int
+) -> list[dict[str, Any]]:
+    """Merge per-intent candidate lists into one ranked list.
+
+    Dedup by `call_name` keeping the entry with the max `score`; sort by score
+    descending with a deterministic tie-break on `call_name`; truncate to `cap`
+    (cap <= 0 means no truncation). Pure and deterministic — no I/O."""
+    best: dict[str, dict[str, Any]] = {}
+    for lst in lists:
+        for c in lst:
+            name = c.get("call_name")
+            if not name:
+                continue
+            prev = best.get(name)
+            if prev is None or (c.get("score") or 0) > (prev.get("score") or 0):
+                best[name] = c
+    merged = sorted(
+        best.values(),
+        key=lambda c: (-(c.get("score") or 0), c.get("call_name") or ""),
+    )
+    return merged[:cap] if cap > 0 else merged
+
 
 def _shortlist_description(text: str) -> str:
     """Truncate a tool description to a short teaser for the find_tools shortlist.
