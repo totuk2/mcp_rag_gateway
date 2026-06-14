@@ -135,14 +135,16 @@ class LlmPlanner(Planner):
 
     async def decompose(self, query: str) -> list[str]:
         """Return short per-capability search phrases for the task, or [] on any
-        parse failure (caller falls back to single-query retrieval)."""
-        content = await self._chat([
-            {"role": "system", "content": _DECOMPOSE_SYSTEM_PROMPT},
-            {"role": "user", "content": f"TASK:\n{query}\n\nReturn the intents JSON now."},
-        ])
+        failure (parse, network, or config) — callers fall back to single-query
+        retrieval, so decomposition must never break planning."""
         try:
+            content = await self._chat([
+                {"role": "system", "content": _DECOMPOSE_SYSTEM_PROMPT},
+                {"role": "user", "content": f"TASK:\n{query}\n\nReturn the intents JSON now."},
+            ])
             raw = _parse_json_object(content)
-        except RuntimeError:
+        except Exception:
+            logger.debug("planner decompose failed; returning no intents", exc_info=True)
             return []
         intents = raw.get("intents")
         if not isinstance(intents, list):
