@@ -37,6 +37,15 @@ _SYSTEM_PROMPT = (
     "`missing`. Keep the plan minimal."
 )
 
+_DECOMPOSE_SYSTEM_PROMPT = (
+    "You split a user TASK into short, independent search phrases — one per distinct "
+    "capability or tool the task needs (e.g. 'search arxiv for papers', 'take a "
+    "screenshot of a web page'). Each phrase is a standalone query used to look up the "
+    "right tool, so name the action and object, not the whole task. Respond with ONLY "
+    'a JSON object: {"intents": ["phrase", ...]}. Use 1-6 phrases; fewer is fine for '
+    "simple tasks. Do not invent capabilities the task does not mention."
+)
+
 
 def _compact_tool(c: dict[str, Any]) -> dict[str, Any]:
     """Trim a candidate to the fields the planner needs (keeps the prompt small)."""
@@ -59,6 +68,10 @@ class Planner(ABC):
     @abstractmethod
     async def plan(self, query: str, candidates: Sequence[dict[str, Any]]) -> dict[str, Any]:
         """Return {"steps": [...], "notes": str, "missing": [...]} for the task."""
+
+    @abstractmethod
+    async def decompose(self, query: str) -> list[str]:
+        """Split a task into short per-capability search phrases (best-effort)."""
 
 
 class LlmPlanner(Planner):
@@ -84,38 +97,57 @@ class LlmPlanner(Planner):
         self._timeout = timeout
 
     async def plan(self, query: str, candidates: Sequence[dict[str, Any]]) -> dict[str, Any]:
-        if not self._url:
-            raise RuntimeError("LlmPlanner: TOOL_RAG_PLANNER_URL not configured")
-        if not self._model:
-            raise RuntimeError("LlmPlanner: TOOL_RAG_PLANNER_MODEL not configured")
-        import httpx
-
         tools = [_compact_tool(c) for c in candidates]
         valid_names = {t["call_name"] for t in tools}
         user = (
             f"TASK:\n{query}\n\nAVAILABLE TOOLS (JSON):\n{json.dumps(tools)}\n\n"
             "Return the plan JSON now."
         )
+        content = await self._chat([
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": user},
+        ])
+        raw = _parse_json_object(content)
+        return _normalize_plan(raw, valid_names, candidates)
+
+    async def _chat(self, messages: list[dict[str, str]]) -> str:
+        """POST an OpenAI-shaped chat-completions request and return message content."""
+        if not self._url:
+            raise RuntimeError("LlmPlanner: TOOL_RAG_PLANNER_URL not configured")
+        if not self._model:
+            raise RuntimeError("LlmPlanner: TOOL_RAG_PLANNER_MODEL not configured")
+        import httpx
+
         body: dict[str, Any] = {
             "model": self._model,
-            "messages": [
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": user},
-            ],
+            "messages": messages,
             "temperature": self._temperature,
             "response_format": {"type": "json_object"},
         }
         headers = {"Content-Type": "application/json"}
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
-
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             resp = await client.post(self._url, json=body, headers=headers)
             resp.raise_for_status()
             data = resp.json()
-        content = data["choices"][0]["message"]["content"]
-        raw = _parse_json_object(content)
-        return _normalize_plan(raw, valid_names, candidates)
+        return data["choices"][0]["message"]["content"]
+
+    async def decompose(self, query: str) -> list[str]:
+        """Return short per-capability search phrases for the task, or [] on any
+        parse failure (caller falls back to single-query retrieval)."""
+        content = await self._chat([
+            {"role": "system", "content": _DECOMPOSE_SYSTEM_PROMPT},
+            {"role": "user", "content": f"TASK:\n{query}\n\nReturn the intents JSON now."},
+        ])
+        try:
+            raw = _parse_json_object(content)
+        except RuntimeError:
+            return []
+        intents = raw.get("intents")
+        if not isinstance(intents, list):
+            return []
+        return [s.strip() for s in intents if isinstance(s, str) and s.strip()]
 
 
 def _parse_json_object(content: str) -> dict[str, Any]:
