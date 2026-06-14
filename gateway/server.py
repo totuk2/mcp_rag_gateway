@@ -330,8 +330,8 @@ def _plan_definition() -> types.Tool:
                 },
                 "top_k": {
                     "type": "integer",
-                    "description": "Max candidate tools to consider (default 10).",
-                    "default": 10,
+                    "description": "Max candidate tools (after per-intent union) to consider (default 30).",
+                    "default": 30,
                 },
             },
             "required": ["query"],
@@ -385,6 +385,49 @@ def build_gateway_server(
             if len(out) >= top_k:
                 break
         return out, result.fallback_used
+
+    async def _gather_candidates_multi(query: str, top_k: int) -> list[dict[str, Any]]:
+        """plan-only: decompose the task, retrieve per intent (+ the full query),
+        and union the candidates. Falls back to single-query retrieval whenever
+        decomposition yields nothing or every per-intent retrieval fails, so this
+        never returns worse candidates than `_gather_candidates` alone."""
+        assert planner is not None
+        try:
+            max_intents = int(os.environ.get("TOOL_RAG_PLAN_MAX_INTENTS", DEFAULT_PLAN_MAX_INTENTS))
+        except (TypeError, ValueError):
+            max_intents = DEFAULT_PLAN_MAX_INTENTS
+        try:
+            per_intent_k = int(os.environ.get("TOOL_RAG_PLAN_PER_INTENT_K", DEFAULT_PLAN_PER_INTENT_K))
+        except (TypeError, ValueError):
+            per_intent_k = DEFAULT_PLAN_PER_INTENT_K
+
+        try:
+            intents = await planner.decompose(query)
+        except Exception:
+            logger.debug("plan decompose failed; single-query candidates", exc_info=True)
+            intents = []
+        intents = [s for s in intents if isinstance(s, str) and s.strip()][:max_intents]
+        if not intents:
+            single, _ = await _gather_candidates(query, top_k)
+            return single
+
+        queries = [query] + intents  # full query always included as a base intent
+        settled = await asyncio.gather(
+            *[_gather_candidates(q, per_intent_k) for q in queries],
+            return_exceptions=True,
+        )
+        lists: list[list[dict[str, Any]]] = []
+        for s in settled:
+            if isinstance(s, BaseException):
+                logger.debug("per-intent retrieval failed", exc_info=s)
+                continue
+            cands, _fallback = s
+            lists.append(cands)
+        merged = _union_candidates(lists, top_k)
+        if not merged:
+            single, _ = await _gather_candidates(query, top_k)
+            return single
+        return merged
 
     async def _register_session_tools(results: list[dict[str, Any]], lazy: bool) -> None:
         """Register discovered tools on this session + notify the client so strict
@@ -647,12 +690,12 @@ def build_gateway_server(
         if not query or not isinstance(query, str):
             return _err_tool("plan requires a non-empty string `query`.")
         try:
-            top_k = int(args.get("top_k", 10))
+            top_k = int(args.get("top_k", DEFAULT_PLAN_TOP_K))
         except (TypeError, ValueError):
-            top_k = 10
+            top_k = DEFAULT_PLAN_TOP_K
         if not get_policy().servers:
             return _err_tool("No servers are granted to this API key.")
-        candidates, _ = await _gather_candidates(query, top_k)
+        candidates = await _gather_candidates_multi(query, top_k)
         if not candidates:
             payload = {"query": query, "steps": [], "notes": "No relevant tools found.",
                        "missing": []}
