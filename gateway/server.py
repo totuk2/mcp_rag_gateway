@@ -90,11 +90,11 @@ def _union_candidates(
             if not name:
                 continue
             prev = best.get(name)
-            if prev is None or (c.get("score") or 0) > (prev.get("score") or 0):
+            if prev is None or c.get("score", 0) > prev.get("score", 0):
                 best[name] = c
     merged = sorted(
         best.values(),
-        key=lambda c: (-(c.get("score") or 0), c.get("call_name") or ""),
+        key=lambda c: (-c.get("score", 0), c.get("call_name") or ""),
     )
     return merged[:cap] if cap > 0 else merged
 
