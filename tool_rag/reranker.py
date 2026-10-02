@@ -38,6 +38,9 @@ DEFAULT_RERANKER_MODEL = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
 # catalog scale regardless of the caller's top_k / over-fetch.
 MAX_RERANK_CANDIDATES = 50
 
+# Small batches over length-sorted pairs (see LocalReranker.score).
+_PREDICT_BATCH_SIZE = 4
+
 # Worker start = torch import + model load: ~7s warm, longer on a first-ever
 # HF download. One scoring request takes <1s; the timeout only catches a hang.
 _WORKER_START_TIMEOUT = 300.0
@@ -102,11 +105,20 @@ class LocalReranker(Reranker):
         if not documents:
             return []
         self._load()
-        pairs = [(query, doc) for doc in documents]
-        raw = self._model.predict(pairs)  # type: ignore[union-attr]
-        # CrossEncoder.predict returns logits; squash to [0,1] so the score can
-        # feed the ranker's semantic_score slot cleanly.
-        return [_sigmoid(float(s)) for s in raw]
+        # A batch is padded to its longest pair, and a few tool descriptions run
+        # to 512 tokens while the median is ~60 — unsorted, nearly every pair
+        # pays for 512. Length-sorted small batches keep padding local: ~4x
+        # faster, same scores (padding is masked out).
+        order = sorted(range(len(documents)), key=lambda i: len(documents[i]))
+        raw = self._model.predict(  # type: ignore[union-attr]
+            [(query, documents[i]) for i in order], batch_size=_PREDICT_BATCH_SIZE
+        )
+        scores = [0.0] * len(documents)
+        for i, s in zip(order, raw):
+            # CrossEncoder.predict returns logits; squash to [0,1] so the score
+            # can feed the ranker's semantic_score slot cleanly.
+            scores[i] = _sigmoid(float(s))
+        return scores
 
     async def ascore(self, query: str, documents: Sequence[str]) -> list[float] | None:
         return await asyncio.to_thread(self.score, query, documents)
