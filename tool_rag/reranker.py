@@ -64,10 +64,11 @@ class Reranker(ABC):
     """Abstract (query, document) pair scorer."""
 
     @abstractmethod
-    async def ascore(self, query: str, documents: Sequence[str]) -> list[float] | None:
+    async def ascore(self, query: str, documents: Sequence[str], wait: bool = False) -> list[float] | None:
         """Return one relevance score in [0, 1] per document, aligned to input
         order — or None when no scores are available right now (the caller
-        keeps its first-stage ranking)."""
+        keeps its first-stage ranking). `wait=True` asks to wait out a cold
+        start instead (for callers that need comparable scores)."""
 
     async def aclose(self) -> None:
         """Release resources (no-op by default)."""
@@ -111,7 +112,8 @@ class LocalReranker(Reranker):
         # faster, same scores (padding is masked out).
         order = sorted(range(len(documents)), key=lambda i: len(documents[i]))
         raw = self._model.predict(  # type: ignore[union-attr]
-            [(query, documents[i]) for i in order], batch_size=_PREDICT_BATCH_SIZE
+            [(query, documents[i]) for i in order], batch_size=_PREDICT_BATCH_SIZE,
+            show_progress_bar=False,  # one bar per batch otherwise floods the gateway log
         )
         scores = [0.0] * len(documents)
         for i, s in zip(order, raw):
@@ -120,7 +122,7 @@ class LocalReranker(Reranker):
             scores[i] = _sigmoid(float(s))
         return scores
 
-    async def ascore(self, query: str, documents: Sequence[str]) -> list[float] | None:
+    async def ascore(self, query: str, documents: Sequence[str], wait: bool = False) -> list[float] | None:
         return await asyncio.to_thread(self.score, query, documents)
 
 
@@ -155,7 +157,7 @@ class WorkerReranker(Reranker):
         self._last_used = 0.0
         self._retry_at = 0.0  # back-off after a failed start (e.g. model can't load)
 
-    async def ascore(self, query: str, documents: Sequence[str]) -> list[float] | None:
+    async def ascore(self, query: str, documents: Sequence[str], wait: bool = False) -> list[float] | None:
         if not documents:
             return []
         self._last_used = time.monotonic()
@@ -163,7 +165,7 @@ class WorkerReranker(Reranker):
             if time.monotonic() < self._retry_at:
                 return None
             starting = self._ensure_starting()
-            if self._cold_start != "wait":
+            if self._cold_start != "wait" and not wait:
                 logger.info("Reranker worker not ready; ranking with embedder only while it starts")
                 return None
             await asyncio.shield(starting)

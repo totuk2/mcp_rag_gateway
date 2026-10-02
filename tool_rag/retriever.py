@@ -49,6 +49,10 @@ class RetrievalResult:
     query: str
     results: list[ScoredTool]
     fallback_used: bool = False
+    # True when the cross-encoder scored this result set. Score scales differ
+    # with and without it (reranker sigmoid vs bi-encoder cosine), which matters
+    # to absolute-threshold consumers like the catalog's coverage verdict.
+    reranked: bool = False
 
 
 class Retriever:
@@ -87,8 +91,10 @@ class Retriever:
         allowed_servers: Sequence[str] | None = None,
         permission_scope: str | None = None,
         tool_type: ToolType | None = None,
+        wait_for_rerank: bool = False,
     ) -> RetrievalResult:
-        """Run the full retrieval pipeline."""
+        """Run the full retrieval pipeline. `wait_for_rerank` waits out a
+        reranker cold start (absolute-score consumers like catalog coverage)."""
         # 1. Embed (query-side instruction prefix applied for asymmetric models)
         query_vec = self._embedder.embed_query(query)
 
@@ -126,12 +132,14 @@ class Retriever:
         # score with a jointly-scored (query, tool) relevance in [0,1]. Bounded
         # to the top MAX_RERANK_CANDIDATES by FAISS order. None = reranker not
         # available right now (worker cold/failed): keep the embedder scores.
+        reranked = False
         if self._reranker is not None and filtered:
             pool = filtered[:MAX_RERANK_CANDIDATES]
             docs = [f"{rec.tool_name}: {rec.description}" for rec, _ in pool]
-            rerank_scores = await self._reranker.ascore(query, docs)
+            rerank_scores = await self._reranker.ascore(query, docs, wait=wait_for_rerank)
             if rerank_scores is not None:
                 filtered = [(rec, rs) for (rec, _), rs in zip(pool, rerank_scores)]
+                reranked = True
 
         # 4. Rank with the (possibly reranked) semantic score, sort, tie-break
         scored: list[tuple[float, ToolRecord]] = []
@@ -165,7 +173,7 @@ class Retriever:
             for score, record in top
         ]
 
-        return RetrievalResult(query=query, results=results)
+        return RetrievalResult(query=query, results=results, reranked=reranked)
 
     def _fallback(
         self,
