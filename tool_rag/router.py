@@ -5,6 +5,8 @@ Endpoints (spec section 8):
   POST /tool-rag/reindex    —  trigger index rebuild
   GET  /tool-rag/health     —  index + DB health
   GET  /tool-rag/metrics    —  index / sync metrics
+  GET  /tool-rag/catalog    —  catalog overview / ?category= / ?query= coverage
+  POST /tool-rag/catalog/refresh — force catalog recompute (admin)
 """
 
 from __future__ import annotations
@@ -28,6 +30,9 @@ from tool_rag.retriever import Retriever
 
 if TYPE_CHECKING:
     from gateway.health import ServerHealth
+    from gateway.registry import Registry
+    from tool_rag.catalog import ToolCatalog
+    from tool_rag.planner import Planner
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +47,14 @@ class ToolRagRouter:
         indexer: ToolRagIndexer | None = None,
         retriever: Retriever | None = None,
         server_health: "ServerHealth | None" = None,
+        catalog: "ToolCatalog | None" = None,
+        registry: "Registry | None" = None,
+        planner: "Planner | None" = None,
     ):
         self._tool_db = tool_db
+        self._catalog = catalog
+        self._registry = registry
+        self._planner = planner
         self._embedder = embedder or create_embedder()
         self._indexer = indexer or ToolRagIndexer(self._embedder, self._tool_db)
         self._retriever = retriever or Retriever(
@@ -182,6 +193,41 @@ class ToolRagRouter:
             "index_size": self._indexer.size,
             "db_size": self._tool_db.count_tools(),
         })
+
+    # ------------------------------------------------------------------
+    # GET /tool-rag/catalog  —  same views as the browse_tools meta-tool
+    # ------------------------------------------------------------------
+
+    async def catalog(self, request: Request) -> JSONResponse:
+        if self._catalog is None:
+            return JSONResponse({"detail": "catalog not enabled"}, status_code=404)
+        # Policy-scoped like retrieve; None under TOOL_RAG_WITHOUT_AUTH by design.
+        policy = current_policy.get()
+        category = request.query_params.get("category")
+        query = request.query_params.get("query")
+        if category and query:
+            return JSONResponse({"detail": "pass either category or query, not both"}, status_code=400)
+        if query:
+            return JSONResponse(await self._catalog.coverage(policy, query))
+        if category:
+            return JSONResponse(self._catalog.category(policy, category))
+        return JSONResponse(self._catalog.overview(policy))
+
+    # ------------------------------------------------------------------
+    # POST /tool-rag/catalog/refresh  —  force recompute (admin; LLM cost)
+    # ------------------------------------------------------------------
+
+    async def catalog_refresh(self, _request: Request) -> JSONResponse:
+        policy = current_policy.get()
+        if policy is None or not policy.admin:
+            return JSONResponse({"detail": "admin key required"}, status_code=403)
+        if self._registry is None:
+            return JSONResponse({"detail": "catalog not enabled"}, status_code=404)
+        from tool_rag.enrichment import refresh_catalog
+
+        res = await refresh_catalog(self._registry, self._tool_db, self._planner, force=True)
+        reindexed = self._indexer.incremental_reindex() if res.tags_changed else 0
+        return JSONResponse({**res.__dict__, "reindexed": reindexed})
 
     # ------------------------------------------------------------------
     # GET /tool-rag/health

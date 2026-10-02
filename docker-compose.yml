@@ -17,6 +17,10 @@ services:
       # Persist the HuggingFace cache (local embedder + reranker models) so they
       # download once instead of on every container recreate.
       - hf-cache:/root/.cache/huggingface
+      # Persist the tool DB + FAISS index (and the derived tool catalog:
+      # categories, tags, server descriptions) across rebuilds, so an unchanged
+      # catalog costs no LLM calls on restart. Reset: docker volume rm <project>_tool-rag-data
+      - tool-rag-data:/app/data
     # All config lives in .env (copy from .env.example). Not required, so the
     # gateway still boots on app defaults if .env is absent.
     env_file:
@@ -26,6 +30,8 @@ services:
       # Fixed in-container path (tied to the volume mount above) — pinned here so
       # it can't be overridden by an errant .env value.
       MCP_GATEWAY_CONFIG_DIR: /app/config
+      # Pinned to the volume above (overrides any .env value).
+      TOOL_RAG_DB: /app/data/tool_registry.db
     depends_on:
       - arxiv
       
@@ -46,3 +52,4 @@ services:
 
 volumes:
   hf-cache:
+  tool-rag-data:

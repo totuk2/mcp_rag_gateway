@@ -29,6 +29,7 @@ from gateway.registry import Registry
 
 if TYPE_CHECKING:
     from gateway.policy import AccessPolicy
+    from tool_rag.catalog import ToolCatalog
     from tool_rag.retriever import Retriever
     from tool_rag.planner import Planner
 
@@ -57,6 +58,10 @@ DESCRIBE_TOOL_NAME = "describe_tool"
 # Optional planning meta-tool: returns a structured multi-step plan (LLM-backed).
 # Only listed when a planner is configured.
 PLAN_TOOL_NAME = "plan"
+
+# Catalog meta-tool: general questions about what's available (domains,
+# categories, "do I have tools for X?"). Listed when a catalog is wired up.
+BROWSE_TOOLS_NAME = "browse_tools"
 
 # Default cap on concurrent upstream calls in run_tools (overridable per call and
 # via TOOL_RAG_MAX_PARALLEL). Bounds stdio subprocess spawns / upstream load.
@@ -125,7 +130,7 @@ def _shortlist_description(text: str) -> str:
     return cut.rstrip() + "…"
 
 
-def _gateway_instructions(planner_on: bool) -> str:
+def _gateway_instructions(planner_on: bool, catalog_on: bool = False) -> str:
     """MCP `initialize` instructions; surfaced so the agent knows the catalog is
     hidden and how to discover/execute tools. Only set when Tool-RAG is on."""
     base = (
@@ -140,6 +145,13 @@ def _gateway_instructions(planner_on: bool) -> str:
         f"schema). THEN call `{RUN_TOOL_NAME}`/`{RUN_TOOLS_NAME}` with the chosen "
         "`call_name`(s) and `arguments` matching the schema."
     )
+    if catalog_on:
+        base += (
+            f" For general questions — what kinds of tools exist, which categories, "
+            f"whether anything covers a problem — call `{BROWSE_TOOLS_NAME}` (no arguments "
+            f"for an overview, `category` for one category or domain, `query` to check "
+            f"coverage of a problem) before `{FIND_TOOLS_NAME}`."
+        )
     if planner_on:
         base += (
             f" For multi-step tasks, call `{PLAN_TOOL_NAME}` with a `query` to get a "
@@ -178,18 +190,25 @@ def _err_tool(msg: str) -> types.CallToolResult:
     )
 
 
-def _find_tools_definition() -> types.Tool:
-    """The in-band discovery meta-tool advertised to every key."""
+def _find_tools_definition(domains: list[str] | None = None) -> types.Tool:
+    """The in-band discovery meta-tool advertised to every key. `domains` (the
+    key's visible servers) is appended so the agent knows what to expect."""
+    description = (
+        "Discover tools available through this gateway. The full catalog is "
+        "hidden to save context, so you MUST call this to find a tool before "
+        "using it. Describe what you want to accomplish in `query`; "
+        "this returns the most relevant tools with their `call_name` and "
+        "`input_schema`. Then execute the chosen tool using `run_tool` with "
+        "its `call_name` and matching arguments."
+    )
+    if domains:
+        description += (
+            f" Available domains: {', '.join(domains)} (call `{BROWSE_TOOLS_NAME}` "
+            "for categories and descriptions)."
+        )
     return types.Tool(
         name=FIND_TOOLS_NAME,
-        description=(
-            "Discover tools available through this gateway. The full catalog is "
-            "hidden to save context, so you MUST call this to find a tool before "
-            "using it. Describe what you want to accomplish in `query`; "
-            "this returns the most relevant tools with their `call_name` and "
-            "`input_schema`. Then execute the chosen tool using `run_tool` with "
-            "its `call_name` and matching arguments."
-        ),
+        description=description,
         inputSchema={
             "type": "object",
             "properties": {
@@ -339,17 +358,48 @@ def _plan_definition() -> types.Tool:
     )
 
 
+def _browse_tools_definition(summary: str) -> types.Tool:
+    """Catalog meta-tool; `summary` is the key's compact catalog overview."""
+    return types.Tool(
+        name=BROWSE_TOOLS_NAME,
+        description=(
+            "Answer general questions about which tools you have, without loading "
+            "them: call with no arguments for an overview (domains, categories, "
+            "counts); with `category` to inspect one category or domain (\"do I "
+            "have a tool in category X?\"); with `query` to check whether any tool "
+            "covers a problem (\"do I have tools for X?\" -> verdict strong/weak/"
+            f"none). Then use `{FIND_TOOLS_NAME}` to get specific tools. {summary}"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "category": {
+                    "type": "string",
+                    "description": "A category name (or a domain/server name) to inspect.",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "A problem or capability to check coverage for, in natural language.",
+                },
+            },
+        },
+    )
+
+
 def build_gateway_server(
     registry: Registry,
     retriever: "Retriever | None" = None,
     planner: "Planner | None" = None,
     max_parallel: int = DEFAULT_MAX_PARALLEL,
+    catalog: "ToolCatalog | None" = None,
 ) -> Server:
     # Advertise discovery instructions only when Tool-RAG is wired up.
     server = Server(
         "homelab-mcp-gateway",
         version="0.1.0",
-        instructions=_gateway_instructions(planner is not None) if retriever is not None else None,
+        instructions=(
+            _gateway_instructions(planner is not None, catalog is not None) if retriever is not None else None
+        ),
     )
 
     async def _gather_candidates(query: str, top_k: int) -> tuple[list[dict[str, Any]], bool]:
@@ -506,6 +556,35 @@ def build_gateway_server(
             content=[types.TextContent(type="text", text=json.dumps(payload))]
         )
 
+    async def handle_browse_tools(arguments: dict[str, Any] | None) -> types.CallToolResult:
+        """Catalog questions: overview / one category or domain / coverage of a
+        problem. Summaries only for non-admin keys (see tool_rag/catalog.py)."""
+        if catalog is None:
+            return _err_tool("The tool catalog is not enabled on this gateway.")
+        args = arguments or {}
+        category = args.get("category")
+        query = args.get("query")
+        if category is not None and not isinstance(category, str):
+            return _err_tool("`category` must be a string.")
+        if query is not None and not isinstance(query, str):
+            return _err_tool("`query` must be a string.")
+        if category and query:
+            return _err_tool("Pass either `category` or `query`, not both.")
+        policy = get_policy()
+        if query:
+            payload = await catalog.coverage(policy, query)
+        elif category:
+            payload = catalog.category(policy, category)
+        else:
+            payload = catalog.overview(policy)
+            payload["hint"] = (
+                f"Call `{BROWSE_TOOLS_NAME}` with `category` or `query` to drill in, "
+                f"or `{FIND_TOOLS_NAME}` with a task description to get specific tools."
+            )
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
+        )
+
     @server.list_tools()
     async def handle_list_tools(_req: types.ListToolsRequest) -> types.ListToolsResult:
         policy = get_policy()
@@ -515,12 +594,16 @@ def build_gateway_server(
         # full catalog. Omitted entirely when Tool-RAG is disabled.
         base: list[types.Tool] = []
         if retriever is not None:
+            # Per-key catalog summary in the descriptions, so the agent knows what
+            # to expect before searching (list_tools runs per request + policy).
             base = [
-                _find_tools_definition(),
+                _find_tools_definition(catalog.domain_names(policy) if catalog else None),
                 _run_tool_definition(),
                 _run_tools_definition(),
                 _describe_tool_definition(),
             ]
+            if catalog is not None:
+                base.append(_browse_tools_definition(catalog.summary_text(policy)))
             if planner is not None:
                 base.append(_plan_definition())
         if not policy.admin:
@@ -720,6 +803,7 @@ def build_gateway_server(
 
     _META_TOOL_NAMES = {
         FIND_TOOLS_NAME, RUN_TOOL_NAME, RUN_TOOLS_NAME, DESCRIBE_TOOL_NAME, PLAN_TOOL_NAME,
+        BROWSE_TOOLS_NAME,
     }
 
     @server.call_tool(validate_input=False)
@@ -737,6 +821,8 @@ def build_gateway_server(
             return await handle_describe_tool(arguments)
         if name == PLAN_TOOL_NAME:
             return await handle_plan(arguments)
+        if name == BROWSE_TOOLS_NAME:
+            return await handle_browse_tools(arguments)
         return await _dispatch_tool(name, arguments)
 
     @server.list_resources()

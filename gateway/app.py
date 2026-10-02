@@ -21,7 +21,9 @@ from gateway.registry import Registry, load_registries, load_registry
 from gateway.server import build_gateway_server
 from gateway.sync_adapter import SyncAdapter
 from gateway.tool_db import ToolDb
+from tool_rag.catalog import ToolCatalog
 from tool_rag.embedder import create_embedder
+from tool_rag.enrichment import refresh_catalog
 from tool_rag.reranker import create_reranker
 from tool_rag.planner import create_planner
 from tool_rag.indexer import ToolRagIndexer
@@ -89,17 +91,44 @@ def _skip_prefixes():
     return tuple(prefixes)
 
 
-async def resync_loop(registry, tool_db, indexer, interval):
+async def _refresh_catalog_safely(registry, tool_db, planner):
+    """Recompute catalog categories/tags if the tool set changed. Never raises:
+    the catalog is derived data, it must not block sync or indexing. Returns
+    the RefreshResult, or None on an unexpected error."""
+    try:
+        return await refresh_catalog(registry, tool_db, planner)
+    except Exception:
+        logger.exception("Tool catalog refresh failed")
+        return None
+
+
+async def catalog_retry_loop(registry, tool_db, indexer, planner, delays=(60, 120, 240)):
+    """After an incomplete refresh (LLM rate limit / outage), retry a few times
+    with backoff instead of waiting for the next restart or resync."""
+    for delay in delays:
+        await asyncio.sleep(delay)
+        res = await _refresh_catalog_safely(registry, tool_db, planner)
+        if res is not None and res.tags_changed:
+            indexer.incremental_reindex()  # tags are part of the embedding text
+        if res is not None and not res.incomplete:
+            logger.info("Tool catalog retry succeeded")
+            return
+    logger.warning("Tool catalog still incomplete after %d retries; next refresh on restart/resync", len(delays))
+
+
+async def resync_loop(registry, tool_db, indexer, interval, planner=None):
     """Opt-in background re-pull of upstream tool lists (TOOL_RAG_RESYNC_INTERVAL).
 
-    Re-runs full_sync (re-query upstreams + reconcile) then a clean full_reindex,
-    so tool add/deprecate on a *running* upstream is picked up without a restart.
+    Re-runs full_sync (re-query upstreams + reconcile), refreshes the catalog
+    (categories follow added/removed tools), then a clean full_reindex, so tool
+    add/deprecate on a *running* upstream is picked up without a restart.
     Off by default; restart is the default way to refresh the catalog.
     """
     while True:
         await asyncio.sleep(interval)
         try:
             result = await SyncAdapter(registry, tool_db).full_sync()
+            await _refresh_catalog_safely(registry, tool_db, planner)
             indexer.full_reindex()
             logger.info(
                 "Resync: %d servers, %d added, %d updated, %d removed",
@@ -111,8 +140,8 @@ async def resync_loop(registry, tool_db, indexer, interval):
             logger.exception("Background resync failed")
 
 
-def build_starlette_app(registry, key_store, mcp_path=DEFAULT_MCP_PATH, tool_rag_enabled=False, tool_db=None, tool_rag_router=None, server_health=None, retriever=None, anon_policy=None, planner=None, max_parallel=8):
-    mcp = build_gateway_server(registry, retriever=retriever, planner=planner, max_parallel=max_parallel)
+def build_starlette_app(registry, key_store, mcp_path=DEFAULT_MCP_PATH, tool_rag_enabled=False, tool_db=None, tool_rag_router=None, server_health=None, retriever=None, anon_policy=None, planner=None, max_parallel=8, catalog=None):
+    mcp = build_gateway_server(registry, retriever=retriever, planner=planner, max_parallel=max_parallel, catalog=catalog)
     session_manager = StreamableHTTPSessionManager(app=mcp, stateless=False, json_response=False)
     streamable_http_app = StreamableHTTPASGIApp(session_manager)
     is_tr = tool_rag_enabled and tool_rag_router is not None
@@ -131,6 +160,10 @@ def build_starlette_app(registry, key_store, mcp_path=DEFAULT_MCP_PATH, tool_rag
                         "Tool-RAG: synced %d servers, %d added, %d updated, %d removed",
                         result.servers_synced, result.tools_added, result.tools_updated, result.tools_removed,
                     )
+                    # Before reindexing: category tags are part of the embedding text.
+                    catalog_res = await _refresh_catalog_safely(registry, tool_db, planner)
+                    if catalog_res is None or catalog_res.incomplete:
+                        tasks.append(asyncio.create_task(catalog_retry_loop(registry, tool_db, indexer, planner)))
                     mode = os.environ.get("TOOL_RAG_STARTUP_REINDEX", "full").lower()
                     if mode == "incremental":
                         IndexPublisher(tool_db, indexer).publish_sync_results()
@@ -155,7 +188,7 @@ def build_starlette_app(registry, key_store, mcp_path=DEFAULT_MCP_PATH, tool_rag
                         tasks.append(asyncio.create_task(health_loop(server_health, hc_interval, hc_timeout)))
                 resync_interval = float(os.environ.get("TOOL_RAG_RESYNC_INTERVAL", "0"))
                 if resync_interval > 0:
-                    tasks.append(asyncio.create_task(resync_loop(registry, tool_db, indexer, resync_interval)))
+                    tasks.append(asyncio.create_task(resync_loop(registry, tool_db, indexer, resync_interval, planner)))
             try:
                 yield
             finally:
@@ -177,6 +210,8 @@ def build_starlette_app(registry, key_store, mcp_path=DEFAULT_MCP_PATH, tool_rag
             Route("/tool-rag/health", endpoint=tool_rag_router.health, methods=["GET"]),
             Route("/tool-rag/metrics", endpoint=tool_rag_router.metrics, methods=["GET"]),
             Route("/tool-rag/tool/{tool_id:path}", endpoint=tool_rag_router.describe, methods=["GET"]),
+            Route("/tool-rag/catalog", endpoint=tool_rag_router.catalog, methods=["GET"]),
+            Route("/tool-rag/catalog/refresh", endpoint=tool_rag_router.catalog_refresh, methods=["POST"]),
         ])
     return Starlette(routes=routes, lifespan=lifespan, middleware=[Middleware(APIKeyMiddleware, key_store=key_store, skip_prefixes=_skip_prefixes(), anon_policy=anon_policy)])
 
@@ -198,6 +233,7 @@ def app_from_env():
     tool_rag_router = None
     retriever = None
     planner = None
+    catalog = None
     try:
         max_parallel = int(os.environ.get("TOOL_RAG_MAX_PARALLEL", "8"))
     except ValueError:
@@ -207,15 +243,23 @@ def app_from_env():
         db_path = os.environ.get("TOOL_RAG_DB", "tool_registry.db")
         tool_db = ToolDb(db_path)
         embedder = create_embedder()
-        indexer = ToolRagIndexer(embedder, tool_db)
+        # FAISS index lives next to the DB (same persistent volume in compose).
+        data_dir = Path(db_path).parent
+        indexer = ToolRagIndexer(
+            embedder, tool_db, index_path=data_dir / "tool_rag.index", meta_path=data_dir / "tool_rag.meta"
+        )
         reranker = create_reranker()
         planner = create_planner()
         retriever = Retriever(embedder, indexer, tool_db, server_health=server_health, reranker=reranker)
-        tool_rag_router = ToolRagRouter(tool_db, embedder, indexer, retriever, server_health=server_health)
+        catalog = ToolCatalog(tool_db, server_health=server_health, retriever=retriever, planner=planner)
+        tool_rag_router = ToolRagRouter(
+            tool_db, embedder, indexer, retriever, server_health=server_health,
+            catalog=catalog, registry=registry, planner=planner,
+        )
     anon_key_id = os.environ.get("GATEWAY_ANON_KEY", "").strip()
     anon_policy = key_store.by_id(anon_key_id) if anon_key_id else None
     if anon_key_id and anon_policy is None:
         logger.warning("GATEWAY_ANON_KEY=%r not found in keys.yaml; anonymous access disabled", anon_key_id)
     elif anon_policy is not None:
         logger.info("Anonymous access enabled via key_id=%s (GATEWAY_ANON_KEY)", anon_policy.key_id)
-    return build_starlette_app(registry, key_store, mcp_path=mcp_path, tool_rag_enabled=tool_rag_enabled, tool_db=tool_db, tool_rag_router=tool_rag_router, server_health=server_health, retriever=retriever, anon_policy=anon_policy, planner=planner, max_parallel=max_parallel)
+    return build_starlette_app(registry, key_store, mcp_path=mcp_path, tool_rag_enabled=tool_rag_enabled, tool_db=tool_db, tool_rag_router=tool_rag_router, server_health=server_health, retriever=retriever, anon_policy=anon_policy, planner=planner, max_parallel=max_parallel, catalog=catalog)
