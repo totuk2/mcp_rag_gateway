@@ -3,7 +3,10 @@ FROM python:3.12-slim-bookworm
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# CPU-only torch first: the default PyPI wheel is the CUDA build (+~4GB image,
+# +~300MB RSS at import) and the gateway never uses a GPU.
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --no-cache-dir -r requirements.txt
 
 # Optionally bake the cross-encoder reranker into the image so it is warm at boot
 # and needs no HF Hub access at runtime. Gated on TOOL_RAG_RERANKER (compose
