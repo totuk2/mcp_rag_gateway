@@ -313,8 +313,19 @@ mentions `http://` outranking a docs tool for a "Streamable HTTP" query). It
 runs only on the FAISS shortlist (bounded to 50 candidates), so cost stays fixed
 at catalog scale. Default off (no extra model download). Pairs naturally with a
 stronger multilingual `url` embedder. When `TOOL_RAG_RERANKER=local`, `docker
-compose build` bakes the model into the image (warm at boot, no runtime HF fetch);
+compose build` bakes the model into the image (no runtime HF fetch);
 the `hf-cache` volume otherwise downloads it lazily on first use and persists it.
+
+The model runs in a separate worker process (`tool_rag/rerank_worker.py`), not in
+the gateway: torch + the model cost ~900MB RSS, and only a process exit returns
+all of it. The worker starts on the first query that needs it (~6s) and exits
+after `TOOL_RAG_RERANKER_IDLE_SECS` without a request (default 300; `0` = keep it
+running), so an idle gateway sits at ~100MB. With `TOOL_RAG_RERANKER_COLD_START=skip`
+(default) a query that finds the worker cold is ranked by the embedder alone while
+the worker starts in the background — so the first query after an idle period can
+rank differently from later ones; `wait` makes it block until reranked instead.
+A crashed or hung worker degrades to embedder-only ranking and is restarted on
+next use.
 
 ### Meta-tools (in-band orchestration)
 
@@ -446,6 +457,8 @@ export them in your shell instead. All variables are optional — defaults below
 | `TOOL_RAG_EMBED_QUERY_INSTRUCTION` | —                    | Asymmetric-model query prefix: queries are wrapped `Instruct: <this>\nQuery: <q>` (documents embedded raw). Set for instruction-tuned embedders like Qwen3-Embedding; leave empty for symmetric models (MiniLM). Query-side only — no reindex |
 | `TOOL_RAG_RERANKER`            | `off`                    | `off` or `local` — cross-encoder reranking of FAISS candidates |
 | `TOOL_RAG_RERANKER_MODEL`      | `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` | Cross-encoder model (small, multilingual, 14 languages) |
+| `TOOL_RAG_RERANKER_IDLE_SECS`  | `300`                    | Stop the reranker worker process after this many idle seconds (frees ~900MB); `0` = never |
+| `TOOL_RAG_RERANKER_COLD_START` | `skip`                   | `skip` = rank with the embedder alone while the worker starts; `wait` = block until reranked |
 | `TOOL_RAG_MAX_PARALLEL`        | `8`                      | Cap on concurrent `run_tools` upstream calls |
 | `TOOL_RAG_PLANNER`             | `off`                    | `off` or `llm` — enable the LLM-backed `plan` meta-tool |
 | `TOOL_RAG_PLANNER_URL`         | —                        | Chat-completions endpoint for the planner (e.g. `http://ollama:11434/v1/chat/completions`) |
