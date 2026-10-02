@@ -112,6 +112,11 @@ Docker-kind servers are **built by `compose up --build`**, not by the provisione
 so the provisioner needs no Docker socket. Pass flags through `run`, e.g.
 `docker compose run --rm provision --force`.
 
+The tool DB, FAISS index and derived tool catalog live in the `tool-rag-data`
+volume (`/app/data`), so rebuilds keep them and an unchanged catalog costs no LLM
+calls. All of it is derived from the upstreams and rebuilt automatically; to start
+from scratch: `docker compose down && docker volume rm <project>_tool-rag-data`.
+
 ---
 
 ## Adding upstream servers
@@ -341,6 +346,10 @@ policy-scoped and self-hosted (no third party in the loop):
 - **`describe_tool`** `{call_name}` — fetch one tool's full `input_schema` on demand
   (the second phase of lazy discovery). Also registers the tool for strict clients
   via `tools/list_changed`.
+- **`browse_tools`** `{category? | query?}` — general questions about what's available,
+  without loading tools (see [Tool catalog](#tool-catalog-browse_tools)): no arguments →
+  overview of domains and categories with counts; `category` → one category or domain;
+  `query` → "do I have tools for X?" verdict `strong`/`weak`/`none`.
 - **`plan`** `{query, top_k?}` — *only listed when `TOOL_RAG_PLANNER=llm`.* Discovers
   candidates and asks a configurable own/OpenAI-shaped LLM (e.g. your Ollama) for a
   structured multi-step plan: `{steps: [{id, call_name, arguments_hint, depends_on,
@@ -357,6 +366,41 @@ fills arguments, and sequences calls; the planner model (gateway-side) only prod
 the plan. The planner is a bounded JSON task — a 7B–14B instruct model with JSON mode
 suffices, and should be ≥ the client model's planning ability. Enable `plan` when the
 client model is the weak link; a strong client plans fine from `find_tools` alone.
+
+### Tool catalog (`browse_tools`)
+
+The agent can't see the catalog, so `browse_tools` lets it ask general questions
+first ("what kinds of tools do I have?", "do I have anything for X?"). A compact
+per-key overview (~150 tokens: domains with descriptions, categories with counts)
+is also embedded in the `browse_tools` description, and the domain names in
+`find_tools`'s, so the agent knows what to expect before it asks anything.
+
+- **Domains** are the upstream servers, each with a one-sentence description.
+- **Categories** are a **dynamic taxonomy**: the planner LLM derives them from the
+  current tool set and tags every tool with 1–3 of them (`tool_rag/enrichment.py`).
+  They are recomputed whenever a server or tool is added, removed, or changes its
+  description (fingerprint check after every sync — startup, `TOOL_RAG_RESYNC_INTERVAL`,
+  or `POST /tool-rag/catalog/refresh`). An unchanged catalog costs no LLM calls.
+  Existing category names stay stable (previous names are fed back, and a category
+  still carried by a tool is never dropped); only tools whose content changed are
+  re-tagged — everything only when a new category appears. Tags are also added to
+  each tool's embedding text.
+- **Hand-written metadata wins.** Optional manifest `description:` and `categories:`
+  (see `servers/MANIFEST.example.yaml`) override the LLM; manifest categories are
+  always present and always applied to that server's tools. Without a planner the
+  catalog falls back to manifest categories + domains, with descriptions taken from
+  the upstream's own `initialize` instructions.
+- **Coverage verdicts** (`query`) are judged by the planner LLM over the catalog and
+  the top search matches, returning the covering domains/categories and a
+  `suggested_query` for `find_tools`. Generic tools (browser automation, code
+  execution) that could only do something "by hand" yield at most `weak`. Without a
+  planner the verdict falls back to score thresholds, which are less reliable for
+  oblique or non-English questions.
+- **Scope:** only tools the key can see (granted servers, `tool_prefixes`, active,
+  server up). Non-admin keys get summaries only — never a per-category tool list —
+  unless `TOOL_RAG_CATALOG_LIST_TOOLS=1`; admin keys get the list.
+- **Failures are retried:** an LLM error (e.g. a rate limit) applies a partial
+  result and retries in the background after 1, 2 and 4 minutes.
 
 ### Startup, refresh, and liveness
 
@@ -423,6 +467,14 @@ be granted and visible to the key.
 
 Body `{"mode": "full"}` (rebuild) or `{"mode": "incremental"}` (dirty tools only).
 
+#### `GET /tool-rag/catalog`
+Same views as `browse_tools`: no parameters → overview; `?category=<name>`;
+`?query=<text>` → coverage verdict. Policy-scoped like `retrieve`.
+
+#### `POST /tool-rag/catalog/refresh`
+Admin key only. Forces a full catalog recompute (taxonomy, tags, descriptions —
+LLM calls) and an incremental reindex if tags changed.
+
 #### `GET /tool-rag/health`
 Index size, DB size, `started_at`.
 
@@ -465,12 +517,16 @@ export them in your shell instead. All variables are optional — defaults below
 | `TOOL_RAG_PLANNER_MODEL`       | —                        | Planner model (e.g. `qwen2.5:14b-instruct`) |
 | `TOOL_RAG_PLANNER_API_KEY`     | —                        | Optional bearer for the planner endpoint |
 | `TOOL_RAG_PLANNER_TEMPERATURE` | `0.1`                    | Planner sampling temperature |
-| `TOOL_RAG_DB`                  | `tool_registry.db`       | SQLite path                      |
+| `TOOL_RAG_DB`                  | `tool_registry.db`       | SQLite path; the FAISS index is stored next to it. Pinned to `/app/data/tool_registry.db` (the `tool-rag-data` volume) under compose |
+| `TOOL_RAG_CATALOG_LIST_TOOLS`  | `0`                      | `1` = `browse_tools` `category` also lists tools (≤25) for non-admin keys; default summaries only |
+| `TOOL_RAG_CATALOG_REFRESH_TIMEOUT` | `90`                 | Seconds budget for a catalog refresh's LLM calls; on timeout the previous catalog stays |
+| `TOOL_RAG_CATALOG_STRONG` / `_WEAK` | `0.45` / `0.3`      | Fallback coverage thresholds (no planner) on reranked scores |
+| `TOOL_RAG_CATALOG_STRONG_NORERANK` / `_WEAK_NORERANK` | `0.85` / `0.7` | Same, when the reranker is off |
 | `TOOL_RAG_WITHOUT_AUTH`        | `0`                      | Skip auth for `/tool-rag/`       |
 | `TOOL_RAG_STARTUP_REINDEX`     | `full`                   | `full` \| `incremental` \| `off` — index strategy at startup |
 | `TOOL_RAG_HEALTHCHECK_INTERVAL`| `30`                     | Seconds between upstream liveness probes; `0` disables |
 | `TOOL_RAG_HEALTHCHECK_TIMEOUT` | `5`                      | Per-probe connect timeout (seconds) |
-| `TOOL_RAG_RESYNC_INTERVAL`     | `0`                      | Seconds between background re-pull of upstream tool lists; `0` = off |
+| `TOOL_RAG_RESYNC_INTERVAL`     | `0`                      | Seconds between background re-pull of upstream tool lists (and catalog refresh); `0` = off. E.g. `600` to follow tool changes on running upstreams |
 | `TOOL_RAG_SHORTLIST_DESC_CHARS`| `300`                    | Cap (chars) on the teaser description in the `find_tools` shortlist; `0` = full text. Full description always available via `describe_tool` and used for embedding (no reindex) |
 | `UVICORN_LOG_LEVEL`            | `info`                   | Uvicorn log level                |
 
