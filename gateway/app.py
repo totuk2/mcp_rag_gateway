@@ -163,6 +163,8 @@ def build_starlette_app(registry, key_store, mcp_path=DEFAULT_MCP_PATH, tool_rag
                     t.cancel()
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
+                if retriever is not None:
+                    await retriever.aclose()
 
     routes = [
         Route("/health", health, methods=["GET"]),

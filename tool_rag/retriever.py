@@ -70,6 +70,11 @@ class Retriever:
         self._server_health = server_health
         self._reranker = reranker
 
+    async def aclose(self) -> None:
+        """Stop the reranker worker, if any (called on gateway shutdown)."""
+        if self._reranker is not None:
+            await self._reranker.aclose()
+
     def get_tool(self, tool_id: str) -> ToolRecord | None:
         """Fetch a single tool record by its id (== merged call_name). O(1) PK
         lookup; used by the describe_tool lazy-schema path."""
@@ -119,12 +124,14 @@ class Retriever:
 
         # 3b. Optional cross-encoder rerank: replace the bi-encoder semantic
         # score with a jointly-scored (query, tool) relevance in [0,1]. Bounded
-        # to the top MAX_RERANK_CANDIDATES by FAISS order.
+        # to the top MAX_RERANK_CANDIDATES by FAISS order. None = reranker not
+        # available right now (worker cold/failed): keep the embedder scores.
         if self._reranker is not None and filtered:
             pool = filtered[:MAX_RERANK_CANDIDATES]
             docs = [f"{rec.tool_name}: {rec.description}" for rec, _ in pool]
-            rerank_scores = self._reranker.score(query, docs)
-            filtered = [(rec, rs) for (rec, _), rs in zip(pool, rerank_scores)]
+            rerank_scores = await self._reranker.ascore(query, docs)
+            if rerank_scores is not None:
+                filtered = [(rec, rs) for (rec, _), rs in zip(pool, rerank_scores)]
 
         # 4. Rank with the (possibly reranked) semantic score, sort, tie-break
         scored: list[tuple[float, ToolRecord]] = []
