@@ -25,11 +25,25 @@ class ServerConfig:
     # http-based
     url: str | None = None
     headers: dict[str, str] | None = None
+    # Catalog metadata (optional, any transport): a hand-written one-sentence
+    # description wins over the LLM/upstream one; categories are forced into
+    # the dynamic tool taxonomy and onto this server's tools.
+    description: str | None = None
+    categories: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class Registry:
     servers: dict[str, ServerConfig]
+
+
+def _catalog_meta(raw: dict[str, Any]) -> dict[str, Any]:
+    desc = raw.get("description")
+    cats = raw.get("categories") or ()
+    return {
+        "description": str(desc).strip() if desc else None,
+        "categories": tuple(str(c) for c in cats),
+    }
 
 
 def _one_server(server_id: str, raw: dict[str, Any]) -> ServerConfig:
@@ -44,6 +58,7 @@ def _one_server(server_id: str, raw: dict[str, Any]) -> ServerConfig:
             args=tuple(raw.get("args") or ()),
             env=dict(raw["env"]) if raw.get("env") else None,
             cwd=raw.get("cwd"),
+            **_catalog_meta(raw),
         )
     url = raw.get("url")
     if not url:
@@ -54,6 +69,7 @@ def _one_server(server_id: str, raw: dict[str, Any]) -> ServerConfig:
         transport=transport,  # type: ignore[arg-type]
         url=url,
         headers=headers,
+        **_catalog_meta(raw),
     )
 
 

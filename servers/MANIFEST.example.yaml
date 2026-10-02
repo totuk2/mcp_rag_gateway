@@ -4,6 +4,12 @@
 #
 # `id` must match [A-Za-z0-9._-]+ and must not contain "__" (it's the namespace
 # separator). Defaults to the directory name if omitted.
+#
+# Optional catalog metadata (any kind) for the `browse_tools` meta-tool. Both are
+# derived automatically by the planner LLM when omitted; set them to override:
+#   description: "PostgreSQL database access."   # one sentence: what the server is for
+#   categories: [database]                       # kebab-case; always in the taxonomy,
+#                                                # always applied to this server's tools
 
 # ── kind: stdio ──  built/installed locally, run as a subprocess by the gateway.
 id: my-stdio-server
