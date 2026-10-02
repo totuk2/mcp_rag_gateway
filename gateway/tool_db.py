@@ -72,6 +72,41 @@ class ToolDb:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tools_tool_type ON tools(tool_type)"
         )
+        # Catalog (tool_rag/enrichment.py): per-server profile, per-tool tag cache,
+        # and the versioned dynamic taxonomy. Derived data — safe to drop.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS server_profiles (
+                server_id TEXT PRIMARY KEY,
+                description TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT '',
+                fingerprint TEXT NOT NULL DEFAULT '',
+                upstream_title TEXT NOT NULL DEFAULT '',
+                upstream_instructions TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT ''
+            )
+        """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tool_tags (
+                tool_id TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL,
+                taxonomy_version INTEGER NOT NULL,
+                tags TEXT NOT NULL DEFAULT '[]'
+            )
+        """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS catalog_taxonomy (
+                version INTEGER PRIMARY KEY AUTOINCREMENT,
+                catalog_fingerprint TEXT NOT NULL,
+                categories TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """
+        )
         conn.commit()
 
     @staticmethod
@@ -254,6 +289,126 @@ class ToolDb:
                 "SELECT COUNT(DISTINCT server_id) AS cnt FROM tools"
             ).fetchone()
         return row["cnt"] if row else 0
+
+    # ------------------------------------------------------------------
+    # Catalog: server profiles, tool tag cache, taxonomy
+    # ------------------------------------------------------------------
+
+    def set_server_upstream_info(self, server_id: str, title: str, instructions: str) -> None:
+        """Record what the upstream said about itself at `initialize` (sync time)."""
+        with self._lock:
+            conn = self._connect()
+            conn.execute(
+                """
+                INSERT INTO server_profiles (server_id, upstream_title, upstream_instructions, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(server_id) DO UPDATE SET
+                    upstream_title=excluded.upstream_title,
+                    upstream_instructions=excluded.upstream_instructions
+                """,
+                (server_id, title, instructions, self._now()),
+            )
+            conn.commit()
+
+    def save_server_profile(self, server_id: str, description: str, source: str, fingerprint: str) -> None:
+        with self._lock:
+            conn = self._connect()
+            conn.execute(
+                """
+                INSERT INTO server_profiles (server_id, description, source, fingerprint, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(server_id) DO UPDATE SET
+                    description=excluded.description,
+                    source=excluded.source,
+                    fingerprint=excluded.fingerprint,
+                    updated_at=excluded.updated_at
+                """,
+                (server_id, description, source, fingerprint, self._now()),
+            )
+            conn.commit()
+
+    def list_server_profiles(self) -> dict[str, dict[str, Any]]:
+        with self._lock:
+            rows = self._connect().execute("SELECT * FROM server_profiles").fetchall()
+        return {r["server_id"]: dict(r) for r in rows}
+
+    def delete_server_profile(self, server_id: str) -> None:
+        with self._lock:
+            conn = self._connect()
+            conn.execute("DELETE FROM server_profiles WHERE server_id = ?", (server_id,))
+            conn.commit()
+
+    def get_all_tool_tags(self) -> dict[str, dict[str, Any]]:
+        """tool_id -> {fingerprint, taxonomy_version, tags: tuple}."""
+        with self._lock:
+            rows = self._connect().execute("SELECT * FROM tool_tags").fetchall()
+        return {
+            r["tool_id"]: {
+                "fingerprint": r["fingerprint"],
+                "taxonomy_version": r["taxonomy_version"],
+                "tags": tuple(json.loads(r["tags"])),
+            }
+            for r in rows
+        }
+
+    def save_tool_tags(self, entries: dict[str, tuple[str, int, tuple[str, ...]]]) -> None:
+        """Bulk upsert tool_id -> (fingerprint, taxonomy_version, tags)."""
+        with self._lock:
+            conn = self._connect()
+            conn.executemany(
+                """
+                INSERT INTO tool_tags (tool_id, fingerprint, taxonomy_version, tags)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(tool_id) DO UPDATE SET
+                    fingerprint=excluded.fingerprint,
+                    taxonomy_version=excluded.taxonomy_version,
+                    tags=excluded.tags
+                """,
+                [(tid, fp, ver, self._serialize(list(tags))) for tid, (fp, ver, tags) in entries.items()],
+            )
+            conn.commit()
+
+    def delete_tool_tags(self, tool_ids: list[str]) -> None:
+        with self._lock:
+            conn = self._connect()
+            conn.executemany("DELETE FROM tool_tags WHERE tool_id = ?", [(t,) for t in tool_ids])
+            conn.commit()
+
+    def get_current_taxonomy(self) -> dict[str, Any] | None:
+        """Latest taxonomy: {version, catalog_fingerprint, categories: [{name, description}]}."""
+        with self._lock:
+            row = self._connect().execute(
+                "SELECT * FROM catalog_taxonomy ORDER BY version DESC LIMIT 1"
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "version": row["version"],
+            "catalog_fingerprint": row["catalog_fingerprint"],
+            "categories": json.loads(row["categories"]),
+        }
+
+    def save_taxonomy(self, catalog_fingerprint: str, categories: list[dict[str, str]]) -> int:
+        """Store a new taxonomy version; returns its version number."""
+        with self._lock:
+            conn = self._connect()
+            cur = conn.execute(
+                "INSERT INTO catalog_taxonomy (catalog_fingerprint, categories, created_at) VALUES (?, ?, ?)",
+                (catalog_fingerprint, self._serialize(categories), self._now()),
+            )
+            conn.commit()
+        return int(cur.lastrowid)
+
+    def update_taxonomy(self, version: int, catalog_fingerprint: str, categories: list[dict[str, str]]) -> None:
+        """Rewrite a taxonomy version in place (same category names, new fingerprint
+        and/or descriptions) — tags assigned under it stay valid."""
+        with self._lock:
+            conn = self._connect()
+            conn.execute(
+                "UPDATE catalog_taxonomy SET catalog_fingerprint = ?, categories = ? WHERE version = ?",
+                (catalog_fingerprint, self._serialize(categories), version),
+            )
+            conn.commit()
 
     def close(self) -> None:
         with self._lock:

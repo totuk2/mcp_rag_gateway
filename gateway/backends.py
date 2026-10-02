@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import AsyncIterator, Callable
+
+import mcp.types as types
 
 import httpx
 from mcp.client.session import ClientSession
@@ -16,7 +18,12 @@ from gateway.registry import ServerConfig
 
 
 @asynccontextmanager
-async def open_upstream_session(cfg: ServerConfig) -> AsyncIterator[ClientSession]:
+async def open_upstream_session(
+    cfg: ServerConfig,
+    on_init: Callable[[types.InitializeResult], None] | None = None,
+) -> AsyncIterator[ClientSession]:
+    """Open an initialized session. `on_init` receives the upstream's
+    InitializeResult (serverInfo, instructions) — used by the catalog sync."""
     if cfg.transport == "stdio":
         if not cfg.command:
             raise ValueError(f"stdio server {cfg.server_id!r} needs command")
@@ -28,7 +35,9 @@ async def open_upstream_session(cfg: ServerConfig) -> AsyncIterator[ClientSessio
         )
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:
-                await session.initialize()
+                init = await session.initialize()
+                if on_init is not None:
+                    on_init(init)
                 yield session
         return
 
@@ -38,7 +47,9 @@ async def open_upstream_session(cfg: ServerConfig) -> AsyncIterator[ClientSessio
     if cfg.transport == "sse":
         async with sse_client(cfg.url, headers=cfg.headers or {}) as (read, write):
             async with ClientSession(read, write) as session:
-                await session.initialize()
+                init = await session.initialize()
+                if on_init is not None:
+                    on_init(init)
                 yield session
         return
 
@@ -49,7 +60,9 @@ async def open_upstream_session(cfg: ServerConfig) -> AsyncIterator[ClientSessio
             async with streamable_http_client(cfg.url, http_client=http_client) as streams:
                 read, write, _get_id = streams
                 async with ClientSession(read, write) as session:
-                    await session.initialize()
+                    init = await session.initialize()
+                    if on_init is not None:
+                        on_init(init)
                     yield session
         return
 

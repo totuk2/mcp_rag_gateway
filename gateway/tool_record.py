@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal
@@ -38,3 +39,10 @@ class ToolRecord:
     @classmethod
     def compose_tool_id(cls, server_id: str, tool_name: str) -> str:
         return f"{server_id}__{tool_name}"
+
+    @property
+    def content_fingerprint(self) -> str:
+        """Hash of what catalog tagging depends on (name + description): an
+        unchanged fingerprint means cached category tags are still valid."""
+        h = hashlib.sha256(f"{self.tool_name}\0{self.description}".encode("utf-8"))
+        return h.hexdigest()[:16]

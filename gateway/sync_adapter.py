@@ -7,7 +7,7 @@ to each server, calls list_tools(), and stores the results.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
 from gateway.backends import open_upstream_session
@@ -52,13 +52,26 @@ class SyncAdapter:
     async def full_sync(self) -> SyncResult:
         """Sync every server in the registry."""
         result = SyncResult()
+        # Catalog tags live in tool_tags (tool_rag/enrichment.py). Re-apply the
+        # cached ones here so a sync doesn't wipe them from the tools table (and
+        # from the embedding text) between catalog refreshes.
+        taxonomy = self._tool_db.get_current_taxonomy()
+        tax_version = taxonomy["version"] if taxonomy else None
+        tag_cache = self._tool_db.get_all_tool_tags()
         for server_id, cfg in self._registry.servers.items():
             try:
                 seen_ids: set[str] = set()
-                async with open_upstream_session(cfg) as session:
+                async with open_upstream_session(cfg, on_init=self._upstream_info_recorder(server_id)) as session:
                     tr = await session.list_tools()
                     for tool in tr.tools:
                         record = self._tool_from_mcp(tool, server_id, cfg.transport)
+                        cached = tag_cache.get(record.tool_id)
+                        if (
+                            cached is not None
+                            and cached["taxonomy_version"] == tax_version
+                            and cached["fingerprint"] == record.content_fingerprint
+                        ):
+                            record = replace(record, tags=cached["tags"])
                         existing = self._tool_db.get_tool(record.tool_id)
                         self._tool_db.upsert_tool(record)
                         seen_ids.add(record.tool_id)
@@ -99,6 +112,19 @@ class SyncAdapter:
                 result.tools_removed += 1
                 logger.info("Pruned tool %s (server %s not in registry)", rec.tool_id, rec.server_id)
         return result
+
+    def _upstream_info_recorder(self, server_id: str):
+        """on_init callback: keep the upstream's self-description (serverInfo
+        title/name + instructions) as input for the catalog's server profile."""
+        def record(init) -> None:
+            try:
+                info = init.serverInfo
+                title = getattr(info, "title", None) or getattr(info, "name", "") or ""
+                instructions = (getattr(init, "instructions", None) or "")[:2000]
+                self._tool_db.set_server_upstream_info(server_id, title, instructions)
+            except Exception:
+                logger.debug("could not record upstream info for %s", server_id, exc_info=True)
+        return record
 
     async def incremental_sync(self) -> SyncResult:
         """Same as full_sync for now — MCP servers don't offer delta sync.
