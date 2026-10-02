@@ -12,6 +12,7 @@ Ollama), mirroring the ApiEmbedder pattern. Configured via TOOL_RAG_PLANNER
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -47,6 +48,50 @@ _DECOMPOSE_SYSTEM_PROMPT = (
 )
 
 
+_TAXONOMY_SYSTEM_PROMPT = (
+    "You maintain the category taxonomy for a catalog of tools exposed to AI agents. "
+    "Given the DOMAINS (tool servers with their tools), produce categories that let an "
+    "agent ask 'what kinds of tools do I have?' or 'do I have a tool for X?'. Respond "
+    'with ONLY a JSON object: {"categories": [{"name": "kebab-case-name", '
+    '"description": "<one short sentence: what tools in it do>"}]}. Rules: '
+    "categories describe capabilities (e.g. web-browsing, research-papers, "
+    "circuit-simulation), not server names; a category may span several servers; "
+    "aim for 5-20 categories, fewer for a small catalog; every category must fit at "
+    "least one listed tool. If PREVIOUS categories are given, KEEP their exact names "
+    "when they still fit, add new ones only for capabilities they do not cover, and "
+    "drop ones no tool fits anymore. REQUIRED categories must be included as named."
+)
+
+_TAGGING_SYSTEM_PROMPT = (
+    "You assign catalog categories to the tools of one tool server. Respond with ONLY "
+    'a JSON object: {"description": "<one sentence: what this server is for>", '
+    '"tags": {"<tool name>": ["category", ...]}}. Rules: give every listed tool 1-3 '
+    "category names chosen ONLY from CATEGORIES (exact names); prefer the most specific "
+    "fitting ones. The description summarizes the server's purpose for an agent "
+    "deciding whether to use it (no marketing, no tool lists)."
+)
+
+
+# Extra attempts for a rate-limited / transiently failing chat call.
+_CHAT_RETRIES = 2
+
+_COVERAGE_SYSTEM_PROMPT = (
+    "You judge whether an AI agent's available tools cover a problem. Input: the "
+    "agent's QUESTION (any language), its CATALOG (domains = tool servers with "
+    "descriptions and categories), and the TOP SEARCH MATCHES from a semantic search "
+    "(may be noisy or miss things). Respond with ONLY a JSON object: "
+    '{"verdict": "strong|weak|none", "domains": ["<domain>"], "categories": '
+    '["<category>"], "reason": "<one short sentence>", "suggested_query": '
+    '"<short English search phrase naming the action and object>"}. '
+    "strong = a domain is built for this capability; weak = only partially or "
+    "indirectly — in particular, if the only fit is a GENERIC tool (web-browser "
+    "automation, running arbitrary code) that could do it by hand on some website or "
+    "script, the verdict is at most weak, never strong; none = nothing fits. "
+    "Use only domain and category names from CATALOG. Judge by what the domains do, "
+    "not by search scores alone."
+)
+
+
 def _compact_tool(c: dict[str, Any]) -> dict[str, Any]:
     """Trim a candidate to the fields the planner needs (keeps the prompt small)."""
     schema = c.get("input_schema") or {}
@@ -72,6 +117,27 @@ class Planner(ABC):
     @abstractmethod
     async def decompose(self, query: str) -> list[str]:
         """Split a task into short per-capability search phrases (best-effort)."""
+
+    async def derive_taxonomy(
+        self, domains: Sequence[dict[str, Any]], previous: Sequence[dict[str, str]], required: Sequence[str]
+    ) -> list[dict[str, Any]] | None:
+        """Catalog categories [{name, description}] for the current tool set, or
+        None when unavailable. Unvalidated — the caller validates."""
+        return None
+
+    async def assign_tags(
+        self, server_id: str, server_hint: str, tools: Sequence[dict[str, str]], categories: Sequence[dict[str, str]]
+    ) -> dict[str, Any] | None:
+        """{"description": str, "tags": {tool_name: [category, ...]}} for one
+        server, or None when unavailable. Unvalidated — the caller validates."""
+        return None
+
+    async def judge_coverage(
+        self, question: str, catalog: dict[str, Any], matches: Sequence[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        """{"verdict", "domains", "categories", "reason", "suggested_query"} or
+        None when unavailable. Unvalidated — the caller validates."""
+        return None
 
 
 class LlmPlanner(Planner):
@@ -128,7 +194,18 @@ class LlmPlanner(Planner):
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
         async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.post(self._url, json=body, headers=headers)
+            # Hosted endpoints (e.g. OpenRouter) rate-limit bursts — the catalog
+            # refresh fires several calls at once. Retry 429/5xx briefly,
+            # honouring a small Retry-After.
+            for attempt in range(_CHAT_RETRIES + 1):
+                resp = await client.post(self._url, json=body, headers=headers)
+                if resp.status_code not in (429, 500, 502, 503, 504) or attempt == _CHAT_RETRIES:
+                    break
+                try:
+                    delay = min(float(resp.headers.get("retry-after", "")), 10.0)
+                except ValueError:
+                    delay = 1.5 * (attempt + 1)
+                await asyncio.sleep(delay)
             resp.raise_for_status()
             data = resp.json()
         return data["choices"][0]["message"]["content"]
@@ -150,6 +227,67 @@ class LlmPlanner(Planner):
         if not isinstance(intents, list):
             return []
         return [s.strip() for s in intents if isinstance(s, str) and s.strip()]
+
+    async def derive_taxonomy(
+        self, domains: Sequence[dict[str, Any]], previous: Sequence[dict[str, str]], required: Sequence[str]
+    ) -> list[dict[str, Any]] | None:
+        """Best-effort like decompose: any failure -> None (caller keeps the
+        previous taxonomy / falls back), so a refresh never breaks startup."""
+        user = (
+            f"DOMAINS (JSON):\n{json.dumps(list(domains), ensure_ascii=False)}\n\n"
+            f"PREVIOUS categories (JSON):\n{json.dumps(list(previous), ensure_ascii=False)}\n\n"
+            f"REQUIRED category names: {json.dumps(list(required))}\n\n"
+            "Return the categories JSON now."
+        )
+        try:
+            raw = _parse_json_object(await self._chat([
+                {"role": "system", "content": _TAXONOMY_SYSTEM_PROMPT},
+                {"role": "user", "content": user},
+            ]))
+        except Exception:
+            logger.warning("catalog: taxonomy derivation failed", exc_info=True)
+            return None
+        cats = raw.get("categories")
+        return cats if isinstance(cats, list) else None
+
+    async def assign_tags(
+        self, server_id: str, server_hint: str, tools: Sequence[dict[str, str]], categories: Sequence[dict[str, str]]
+    ) -> dict[str, Any] | None:
+        user = (
+            f"SERVER: {server_id}\n"
+            f"SERVER INFO: {server_hint or '(none)'}\n\n"
+            f"CATEGORIES (JSON):\n{json.dumps(list(categories), ensure_ascii=False)}\n\n"
+            f"TOOLS (JSON):\n{json.dumps(list(tools), ensure_ascii=False)}\n\n"
+            "Return the JSON now."
+        )
+        try:
+            raw = _parse_json_object(await self._chat([
+                {"role": "system", "content": _TAGGING_SYSTEM_PROMPT},
+                {"role": "user", "content": user},
+            ]))
+        except Exception:
+            logger.warning("catalog: tagging failed for server %s", server_id, exc_info=True)
+            return None
+        return raw if isinstance(raw.get("tags"), dict) else None
+
+    async def judge_coverage(
+        self, question: str, catalog: dict[str, Any], matches: Sequence[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        user = (
+            f"QUESTION: {question}\n\n"
+            f"CATALOG (JSON):\n{json.dumps(catalog, ensure_ascii=False)}\n\n"
+            f"TOP SEARCH MATCHES (JSON):\n{json.dumps(list(matches), ensure_ascii=False)}\n\n"
+            "Return the JSON now."
+        )
+        try:
+            raw = _parse_json_object(await self._chat([
+                {"role": "system", "content": _COVERAGE_SYSTEM_PROMPT},
+                {"role": "user", "content": user},
+            ]))
+        except Exception:
+            logger.warning("catalog: coverage judgement failed", exc_info=True)
+            return None
+        return raw if raw.get("verdict") in ("strong", "weak", "none") else None
 
 
 def _parse_json_object(content: str) -> dict[str, Any]:
