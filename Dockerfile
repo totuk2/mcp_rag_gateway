@@ -19,8 +19,6 @@ RUN if [ "$TOOL_RAG_RERANKER" = "local" ]; then \
     fi
 
 COPY gateway/ ./gateway/
-COPY servers/ ./servers/
-COPY gateway/ ./gateway/
 COPY tool_rag/ ./tool_rag/
 COPY servers/ ./servers/
 COPY config/ ./config/
