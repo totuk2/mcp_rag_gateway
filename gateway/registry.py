@@ -30,6 +30,9 @@ class ServerConfig:
     # the dynamic tool taxonomy and onto this server's tools.
     description: str | None = None
     categories: tuple[str, ...] = ()
+    # Server keeps per-session state (e.g. Playwright's open page): reuse one
+    # upstream session per downstream MCP session instead of one per call.
+    stateful: bool = False
 
 
 @dataclass(frozen=True)
@@ -43,6 +46,7 @@ def _catalog_meta(raw: dict[str, Any]) -> dict[str, Any]:
     return {
         "description": str(desc).strip() if desc else None,
         "categories": tuple(str(c) for c in cats),
+        "stateful": bool(raw.get("stateful", False)),
     }
 
 

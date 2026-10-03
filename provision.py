@@ -97,6 +97,11 @@ def catalog_fields(m: dict[str, Any], src: Path) -> dict[str, Any]:
         if not isinstance(cats, list) or not all(isinstance(c, str) and CATEGORY_NAME.match(c) for c in cats):
             raise ManifestError(f"{src}: `categories` must be a list of kebab-case names (e.g. web-browsing)")
         out["categories"] = list(dict.fromkeys(cats))
+    if m.get("stateful") is not None:
+        if not isinstance(m["stateful"], bool):
+            raise ManifestError(f"{src}: `stateful` must be true or false")
+        if m["stateful"]:
+            out["stateful"] = True
     return out
 
 

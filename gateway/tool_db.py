@@ -97,6 +97,28 @@ class ToolDb:
             )
         """
         )
+        # Site recipes (gateway/recipes.py): how to query a website that agents
+        # learned by browser automation. Shared across keys; NOT derived data.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS site_recipes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                site TEXT NOT NULL,
+                task TEXT NOT NULL,
+                label TEXT NOT NULL DEFAULT '',
+                url_template TEXT NOT NULL DEFAULT '',
+                steps TEXT NOT NULL DEFAULT '[]',
+                notes TEXT NOT NULL DEFAULT '',
+                author_key TEXT NOT NULL DEFAULT '',
+                successes INTEGER NOT NULL DEFAULT 0,
+                failures INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                verified_at TEXT NOT NULL DEFAULT '',
+                UNIQUE(site, task)
+            )
+        """
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS catalog_taxonomy (
@@ -409,6 +431,72 @@ class ToolDb:
                 (catalog_fingerprint, self._serialize(categories), version),
             )
             conn.commit()
+
+    # ------------------------------------------------------------------
+    # Site recipes
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _recipe_row(row: sqlite3.Row) -> dict[str, Any]:
+        d = dict(row)
+        d["steps"] = json.loads(d["steps"])
+        return d
+
+    def upsert_recipe(self, site: str, task: str, label: str, url_template: str, steps: list[str],
+                      notes: str, author_key: str) -> dict[str, Any]:
+        """Insert or replace the recipe for (site, task); saving means it just worked,
+        so it counts as a success and refreshes verified_at."""
+        now = self._now()
+        with self._lock:
+            conn = self._connect()
+            conn.execute(
+                """
+                INSERT INTO site_recipes (site, task, label, url_template, steps, notes, author_key,
+                                          successes, failures, created_at, updated_at, verified_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?)
+                ON CONFLICT(site, task) DO UPDATE SET
+                    label=COALESCE(NULLIF(excluded.label, ''), site_recipes.label),
+                    url_template=excluded.url_template, steps=excluded.steps,
+                    notes=excluded.notes, author_key=excluded.author_key,
+                    successes=site_recipes.successes + 1, failures=0,
+                    updated_at=excluded.updated_at, verified_at=excluded.verified_at
+                """,
+                (site, task, label, url_template, self._serialize(steps), notes, author_key, now, now, now),
+            )
+            conn.commit()
+            row = conn.execute("SELECT * FROM site_recipes WHERE site = ? AND task = ?", (site, task)).fetchone()
+        return self._recipe_row(row)
+
+    def report_recipe(self, recipe_id: int, worked: bool) -> dict[str, Any] | None:
+        now = self._now()
+        with self._lock:
+            conn = self._connect()
+            if worked:
+                conn.execute("UPDATE site_recipes SET successes = successes + 1, verified_at = ? WHERE id = ?",
+                             (now, recipe_id))
+            else:
+                conn.execute("UPDATE site_recipes SET failures = failures + 1 WHERE id = ?", (recipe_id,))
+            conn.commit()
+            row = conn.execute("SELECT * FROM site_recipes WHERE id = ?", (recipe_id,)).fetchone()
+        return self._recipe_row(row) if row else None
+
+    def find_recipes(self, site: str | None = None, text: str | None = None, limit: int = 5) -> list[dict[str, Any]]:
+        """By exact site (domain), or by substring over site/label/task. Most reliable first."""
+        clauses, params = [], []
+        if site:
+            clauses.append("site = ?")
+            params.append(site)
+        if text:
+            clauses.append("(site LIKE ? OR label LIKE ? OR task LIKE ?)")
+            params += [f"%{text}%"] * 3
+        where = " WHERE " + " OR ".join(clauses) if clauses else ""
+        with self._lock:
+            rows = self._connect().execute(
+                f"SELECT * FROM site_recipes{where} "
+                "ORDER BY (successes - 2 * failures) DESC, verified_at DESC, id LIMIT ?",
+                (*params, limit),
+            ).fetchall()
+        return [self._recipe_row(r) for r in rows]
 
     def close(self) -> None:
         with self._lock:
