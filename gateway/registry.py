@@ -33,6 +33,8 @@ class ServerConfig:
     # Server keeps per-session state (e.g. Playwright's open page): reuse one
     # upstream session per downstream MCP session instead of one per call.
     stateful: bool = False
+    # Rewrite oversized flight-search results into a short digest (gateway/compactors.py).
+    compact_results: bool = False
 
 
 @dataclass(frozen=True)
@@ -47,6 +49,7 @@ def _catalog_meta(raw: dict[str, Any]) -> dict[str, Any]:
         "description": str(desc).strip() if desc else None,
         "categories": tuple(str(c) for c in cats),
         "stateful": bool(raw.get("stateful", False)),
+        "compact_results": bool(raw.get("compact_results", False)),
     }
 
 

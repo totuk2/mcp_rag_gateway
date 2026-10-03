@@ -7,3 +7,5 @@ transport: streamable_http
 url: "https://mcp.skiplagged.com/mcp"
 description: "Skiplagged flight search with flexible fare calendars and destination discovery; also hotels and rental cars."
 categories: [flight-search]
+# Large search results are rewritten into a short digest by the gateway (run_tool full=true for raw).
+compact_results: true

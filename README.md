@@ -453,6 +453,19 @@ when the client session ends, beyond `STICKY_MAX_SESSIONS` (20, LRU), on upstrea
 single-user homelab. Clients that open a new MCP session per call (e.g. one-shot curl) get
 no stickiness.
 
+### Compact flight-search results
+
+Fare engines return huge payloads (a round-trip search: Kiwi ~54 KB, Google Flights
+~120 KB, Duffel ~63 KB — plus the same again as `structuredContent`). For servers flagged
+`compact_results: true` (`kiwi`, `google-flights`, `flights`, `skiplagged`) the gateway
+rewrites search results into a digest (`gateway/compactors.py`): the first
+`COMPACT_MAX_OPTIONS` (10) options in the engine's order, one line each — price, route,
+times, stops, carriers + flight numbers, return leg, separate-ticket/self-transfer flags,
+bags, booking link — plus the total count. That's 2–4 KB instead of 30–120 KB. Pass
+`"full": true` to `run_tool` (or a `run_tools` item) for the raw result. Unparseable
+results pass through unchanged. Independently, `run_tools` no longer returns a tool's
+`structuredContent` when it has text content (it was a mirror, doubling the size).
+
 ### Site recipes (browser memory)
 
 When an agent manages to get data from a website by browser automation (e.g. an airline's
@@ -621,6 +634,7 @@ export them in your shell instead. All variables are optional — defaults below
 | `TOOL_RAG_DB`                  | `tool_registry.db`       | SQLite path; the FAISS index is stored next to it. Pinned to `/app/data/tool_registry.db` (the `tool-rag-data` volume) under compose |
 | `TOOL_RAG_AGENT`               | `off`                    | `on` = list the `delegate` sub-agent meta-tool (needs `TOOL_RAG_PLANNER=llm` with a tool-calling model) |
 | `TOOL_RAG_AGENT_TIMEOUT`       | `240`                    | Seconds budget for one `delegate` run |
+| `COMPACT_MAX_OPTIONS`          | `10`                     | Options kept per compacted flight-search result (`compact_results` servers) |
 | `STICKY_SESSION_IDLE_SECS`     | `600`                    | Close a sticky upstream session (stateful servers) after this idle time |
 | `STICKY_MAX_SESSIONS`          | `20`                     | Max open sticky upstream sessions (least recently used closed first) |
 | `RECIPES_ENABLED`              | `1`                      | Site recipes (browser memory) on/off |

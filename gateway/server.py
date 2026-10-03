@@ -18,6 +18,7 @@ from mcp.shared.exceptions import McpError
 from pydantic import AnyUrl
 
 from gateway.backends import open_upstream_session
+from gateway.compactors import compact
 from gateway.context import get_policy
 from gateway.merge import (
     gateway_resource_uri,
@@ -295,6 +296,10 @@ def _run_tool_definition() -> types.Tool:
                     "type": "object",
                     "description": "Arguments for the tool, matching its `input_schema`.",
                 },
+                "full": {
+                    "type": "boolean",
+                    "description": "Return the raw result even if the gateway would compact it (large flight searches).",
+                },
             },
             "required": ["call_name"],
         },
@@ -331,6 +336,10 @@ def _run_tools_definition() -> types.Tool:
                             "arguments": {
                                 "type": "object",
                                 "description": "Arguments for the tool, matching its `input_schema`.",
+                            },
+                            "full": {
+                                "type": "boolean",
+                                "description": "Raw result instead of the gateway's compact digest.",
                             },
                         },
                         "required": ["call_name"],
@@ -731,7 +740,7 @@ def build_gateway_server(
             tool_args = args.get("arguments") or {}
             if not isinstance(tool_args, dict):
                 return "ERROR: `arguments` must be an object."
-            res = await _dispatch_tool(name, tool_args)
+            res = await _dispatch_tool(name, tool_args, full=args.get("full") is True)
             text = "\n".join(c.text for c in res.content if isinstance(c, types.TextContent))
             if res.isError:
                 return f"ERROR: {text or 'tool returned an error'}"
@@ -765,7 +774,8 @@ def build_gateway_server(
             AgentTool("describe_tool", "Full input_schema and description of one tool.",
                       {**obj, "properties": {"call_name": {"type": "string"}}, "required": ["call_name"]}, describe),
             AgentTool("run_tool", "Execute a tool by call_name with arguments matching its input_schema.",
-                      {**obj, "properties": {"call_name": {"type": "string"}, "arguments": {"type": "object"}},
+                      {**obj, "properties": {"call_name": {"type": "string"}, "arguments": {"type": "object"},
+                                         "full": {"type": "boolean", "description": "raw result instead of the compact digest"}},
                        "required": ["call_name", "arguments"]}, run),
             AgentTool("get_skill", "Fetch a playbook by name.",
                       {**obj, "properties": {"name": {"type": "string"}}, "required": ["name"]}, skill),
@@ -994,7 +1004,7 @@ def build_gateway_server(
             out.extend(part)
         return types.ListToolsResult(tools=out)
 
-    async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> types.CallToolResult:
+    async def _dispatch_tool(name: str, arguments: dict[str, Any] | None, full: bool = False) -> types.CallToolResult:
         """Inner dispatch: validate access and call an upstream tool by merged name."""
         policy = get_policy()
         try:
@@ -1023,6 +1033,12 @@ def build_gateway_server(
         except Exception as e:
             logger.exception("call_tool upstream error")
             return _err_tool(f"Upstream error: {e}")
+        if cfg.compact_results and not full and not res.isError:
+            text = "\n".join(c.text for c in res.content if isinstance(c, types.TextContent))
+            digest = compact(orig, arguments, text)
+            if digest is not None:
+                logger.info("compacted %s result: %d -> %d chars", name, len(text), len(digest))
+                res = types.CallToolResult(content=[types.TextContent(type="text", text=digest)])
         return _with_recipes(res, arguments)
 
     async def handle_run_tool(arguments: dict[str, Any] | None) -> types.CallToolResult:
@@ -1034,7 +1050,7 @@ def build_gateway_server(
         tool_arguments = args.get("arguments") or {}
         if not isinstance(tool_arguments, dict):
             return _err_tool("`arguments` must be a JSON object.")
-        return await _dispatch_tool(call_name, tool_arguments)
+        return await _dispatch_tool(call_name, tool_arguments, full=args.get("full") is True)
 
     def _result_to_json(res: types.CallToolResult) -> dict[str, Any]:
         """Flatten a CallToolResult into a JSON-able summary for run_tools. On
@@ -1044,10 +1060,12 @@ def build_gateway_server(
         if res.isError:
             out["error"] = texts or "tool returned an error"
             return out
-        if res.structuredContent is not None:
-            out["structured"] = res.structuredContent
+        # Text is the canonical content; structuredContent usually mirrors it (FastMCP),
+        # so include it only when there's no text — never both (doubles the size).
         if texts:
             out["text"] = texts
+        elif res.structuredContent is not None:
+            out["structured"] = res.structuredContent
         non_text = [c.type for c in res.content if not isinstance(c, types.TextContent)]
         if non_text:
             out["content_types"] = non_text
@@ -1079,7 +1097,7 @@ def build_gateway_server(
                 return {**tag, "ok": False, "error": "`arguments` must be a JSON object."}
             async with sem:
                 try:
-                    res = await _dispatch_tool(call["call_name"], tool_args)
+                    res = await _dispatch_tool(call["call_name"], tool_args, full=call.get("full") is True)
                 except Exception as e:  # defensive; _dispatch_tool already catches upstream
                     return {**tag, "ok": False, "error": f"Execution error: {e}"}
             return {**tag, **_result_to_json(res)}

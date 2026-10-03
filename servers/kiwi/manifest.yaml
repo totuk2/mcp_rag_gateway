@@ -6,3 +6,5 @@ transport: streamable_http
 url: "https://mcp.kiwi.com"
 description: "Kiwi.com flight search with self-transfer and multi-airline combinations, flexible dates and booking links."
 categories: [flight-search]
+# Large search results are rewritten into a short digest by the gateway (run_tool full=true for raw).
+compact_results: true
