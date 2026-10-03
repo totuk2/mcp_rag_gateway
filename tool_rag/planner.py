@@ -73,7 +73,7 @@ _TAGGING_SYSTEM_PROMPT = (
 
 
 # Extra attempts for a rate-limited / transiently failing chat call.
-_CHAT_RETRIES = 2
+_CHAT_RETRIES = 4
 
 _COVERAGE_SYSTEM_PROMPT = (
     "You judge whether an AI agent's available tools cover a problem. Input: the "
@@ -178,18 +178,25 @@ class LlmPlanner(Planner):
 
     async def _chat(self, messages: list[dict[str, str]]) -> str:
         """POST an OpenAI-shaped chat-completions request and return message content."""
+        data = await self._post({"messages": messages, "response_format": {"type": "json_object"}})
+        return data["choices"][0]["message"]["content"]
+
+    async def chat_tools(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
+                         tool_choice: str = "auto") -> dict[str, Any]:
+        """Tool-calling chat turn (OpenAI `tools` format); returns the assistant message
+        dict (`content` and/or `tool_calls`). Backs the `delegate` sub-agent."""
+        body: dict[str, Any] = {"messages": messages, "tools": tools, "tool_choice": tool_choice}
+        data = await self._post(body)
+        return data["choices"][0]["message"]
+
+    async def _post(self, extra: dict[str, Any]) -> dict[str, Any]:
         if not self._url:
             raise RuntimeError("LlmPlanner: TOOL_RAG_PLANNER_URL not configured")
         if not self._model:
             raise RuntimeError("LlmPlanner: TOOL_RAG_PLANNER_MODEL not configured")
         import httpx
 
-        body: dict[str, Any] = {
-            "model": self._model,
-            "messages": messages,
-            "temperature": self._temperature,
-            "response_format": {"type": "json_object"},
-        }
+        body: dict[str, Any] = {"model": self._model, "temperature": self._temperature, **extra}
         headers = {"Content-Type": "application/json"}
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
@@ -204,11 +211,10 @@ class LlmPlanner(Planner):
                 try:
                     delay = min(float(resp.headers.get("retry-after", "")), 10.0)
                 except ValueError:
-                    delay = 1.5 * (attempt + 1)
+                    delay = 2.0 * 2 ** attempt  # 2, 4, 8, 16 s
                 await asyncio.sleep(delay)
             resp.raise_for_status()
-            data = resp.json()
-        return data["choices"][0]["message"]["content"]
+            return resp.json()
 
     async def decompose(self, query: str) -> list[str]:
         """Return short per-capability search phrases for the task, or [] on any
