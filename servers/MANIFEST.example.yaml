@@ -10,6 +10,10 @@
 #   description: "PostgreSQL database access."   # one sentence: what the server is for
 #   categories: [database]                       # kebab-case; always in the taxonomy,
 #                                                # always applied to this server's tools
+#
+# Optional, any kind: `stateful: true` if the server keeps state per MCP session (e.g. a
+# browser's open page). The gateway then reuses one upstream session per client session
+# instead of opening a new one per call.
 
 # ── kind: stdio ──  built/installed locally, run as a subprocess by the gateway.
 id: my-stdio-server

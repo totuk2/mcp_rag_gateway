@@ -350,6 +350,14 @@ policy-scoped and self-hosted (no third party in the loop):
   without loading tools (see [Tool catalog](#tool-catalog-browse_tools)): no arguments →
   overview of domains and categories with counts; `category` → one category or domain;
   `query` → "do I have tools for X?" verdict `strong`/`weak`/`none`.
+- **`get_skill`** `{name}` — fetch a playbook (see [Skills](#skills-playbooks-and-delegate));
+  listed when the key can see at least one skill.
+- **`get_site_recipes`** `{query}` / **`save_site_recipe`** `{site, task, url_template?, steps?, …}`
+  — shared memory of how to query websites by browser automation (see
+  [Site recipes](#site-recipes-browser-memory)); `save_site_recipe` is listed only for keys
+  granted a browser server.
+- **`delegate`** `{task, skill?, max_steps?}` — hand a whole multi-step task to a
+  gateway-side sub-agent; *listed when `TOOL_RAG_AGENT=on` and a planner is configured.*
 - **`plan`** `{query, top_k?}` — *only listed when `TOOL_RAG_PLANNER=llm`.* Discovers
   candidates and asks a configurable own/OpenAI-shaped LLM (e.g. your Ollama) for a
   structured multi-step plan: `{steps: [{id, call_name, arguments_hint, depends_on,
@@ -401,6 +409,99 @@ is also embedded in the `browse_tools` description, and the domain names in
   unless `TOOL_RAG_CATALOG_LIST_TOOLS=1`; admin keys get the list.
 - **Failures are retried:** an LLM error (e.g. a rate limit) applies a partial
   result and retries in the background after 1, 2 and 4 minutes.
+
+### Skills (playbooks) and `delegate`
+
+Tools say *what* is possible; a **skill** says *how* to tackle a class of task: which
+tools in which order, what to try when the first search finds nothing, when to stop.
+Skills live in `skills/<name>/SKILL.md` (committed, baked into the image):
+
+```markdown
+---
+name: hard-flight-routing
+description: when to use it (also used to match queries to the skill)
+requires_servers: [flight-research]   # visible only to keys granted all of these
+---
+<procedure in markdown>
+```
+
+They surface in-band: `find_tools` adds `related_skill` (+ "call get_skill") when the
+query matches a skill's description (embedding similarity ≥ `SKILLS_MATCH_THRESHOLD`,
+default 0.5), `browse_tools` lists them and adds `related_skill` to coverage verdicts,
+and `get_skill` returns the body. Skills are re-read on restart.
+
+**`delegate`** runs a task end to end on the gateway: a tool-calling loop on the planner
+model (`tool_rag/agent.py`) with `find_tools` / `describe_tool` / `run_tool` / `get_skill`,
+seeded with the given or best-matching skill. Every upstream call runs inside the
+caller's request, so the calling key's policy applies exactly as for direct calls; the
+sub-agent can't call `delegate` again. Bounded by `max_steps` (default 15, cap 30) and
+`TOOL_RAG_AGENT_TIMEOUT` (default 240 s); sends MCP progress notifications when the
+client passes a `progressToken`. Returns `{answer, steps, stopped_reason, skill}`.
+Clients must allow long tool calls — in LibreChat set the MCP server's `timeout`
+(e.g. `300000`).
+
+### Stateful upstreams (sticky sessions)
+
+The gateway opens a fresh upstream session per tool call, which loses per-session state —
+e.g. Playwright's open page (`browser_navigate` then `browser_snapshot` → `about:blank`).
+Mark such a server `stateful: true` in its manifest (or `registry.yaml`): the gateway then
+keeps **one upstream session per downstream MCP session** and routes that session's calls
+to it, one at a time. Sticky sessions close after `STICKY_SESSION_IDLE_SECS` (600) idle,
+when the client session ends, beyond `STICKY_MAX_SESSIONS` (20, LRU), on upstream failure
+(one retry on a fresh session) and on shutdown. `playwright` is stateful; it keeps
+`--shared-browser-context`, so concurrent client sessions share one browser — fine for a
+single-user homelab. Clients that open a new MCP session per call (e.g. one-shot curl) get
+no stickiness.
+
+### Site recipes (browser memory)
+
+When an agent manages to get data from a website by browser automation (e.g. an airline's
+flight search via Playwright), it saves **how**: `save_site_recipe` with the site, a task
+("search one-way flights"), a `url_template` with placeholders (`{origin}`,
+`{date:YYYY-MM-DD}`) and/or short `steps` naming the labels/buttons used, plus `notes`.
+Next time, the recipe reaches the agent's context without it having to ask: after any
+successful tool call whose arguments contain a URL (e.g. `browser_navigate`), the gateway
+appends that site's recipes to the result (once per MCP session per site);
+`get_site_recipes` looks them up by domain, URL or name. Agents report outcomes
+(`recipe_id` + `worked`); a re-save of the same site+task replaces the steps.
+
+Agents are nudged and, in `delegate`, required to record what they learned: the first
+successful visit to a site without a recipe appends a reminder to save one, and a
+`delegate` run that browsed such a site gets one forced `save_site_recipe` turn before it
+finishes (steps are exact tool calls with key arguments, so they replay as-is). Recipes for
+domains named in a `delegate` task go into its prompt up front.
+
+Stored in the gateway DB (`site_recipes`, persistent `tool-rag-data` volume) and **shared
+across keys**, with guards because recipe text partly originates from web pages and is
+injected into other agents' context: only keys granted a server from
+`RECIPES_WRITER_SERVERS` (default `playwright`) or admin keys may write; size limits;
+a `url_template` must stay on the recipe's own domain; author key, success/failure counts
+and last-worked date are kept (failing recipes sink and are flagged `STALE`); injected
+text is fenced and labelled as untrusted data. The `hard-flight-routing` skill and the
+`delegate` sub-agent use and grow this memory.
+
+### Flight research stack
+
+`servers/flight-research` (our code) plus four fare engines, wired for hard routes
+("Gdańsk → Aleppo"):
+
+| Server | Kind | What | Key |
+|---|---|---|---|
+| `kiwi` | remote | Kiwi.com: self-transfer combos, different-airport connections, ±3 days | — |
+| `skiplagged` | remote | Skiplagged: flights, fare calendars, hotels, cars | — |
+| `google-flights` | docker | Google Flights via [fli](https://github.com/punitarani/fli) | — |
+| `flights` | docker | Duffel (NDC) | `DUFFEL_API_KEY_LIVE` |
+| `flight-research` | docker | `nearby_airports` (OurAirports), `airport_routes` / `airport_schedule` (AeroDataBox), `research_route` | `AERODATABOX_KEY` (optional) |
+
+`research_route(origin, destination, date, …)` expands nearby airports, finds hubs that
+fly into the destination area (AeroDataBox route stats; without a key, from the
+engines' connection airports), queries all engines for the whole trip and for
+origin→hub / hub→destination legs in parallel (~20-75 s budget), combines self-transfer
+legs (≥3 h), and ranks by price + time + risk (self-transfer, stops, ground distance,
+border crossing). It returns a one-line-per-option `summary`, full `options`, `hubs`,
+`coverage` (what ran / failed) and `manual_checks` (last-leg airlines no engine priced —
+check their websites). The `hard-flight-routing` skill drives it plus the fallbacks
+(Playwright on airline sites, stopping at CAPTCHAs).
 
 ### Startup, refresh, and liveness
 
@@ -518,6 +619,14 @@ export them in your shell instead. All variables are optional — defaults below
 | `TOOL_RAG_PLANNER_API_KEY`     | —                        | Optional bearer for the planner endpoint |
 | `TOOL_RAG_PLANNER_TEMPERATURE` | `0.1`                    | Planner sampling temperature |
 | `TOOL_RAG_DB`                  | `tool_registry.db`       | SQLite path; the FAISS index is stored next to it. Pinned to `/app/data/tool_registry.db` (the `tool-rag-data` volume) under compose |
+| `TOOL_RAG_AGENT`               | `off`                    | `on` = list the `delegate` sub-agent meta-tool (needs `TOOL_RAG_PLANNER=llm` with a tool-calling model) |
+| `TOOL_RAG_AGENT_TIMEOUT`       | `240`                    | Seconds budget for one `delegate` run |
+| `STICKY_SESSION_IDLE_SECS`     | `600`                    | Close a sticky upstream session (stateful servers) after this idle time |
+| `STICKY_MAX_SESSIONS`          | `20`                     | Max open sticky upstream sessions (least recently used closed first) |
+| `RECIPES_ENABLED`              | `1`                      | Site recipes (browser memory) on/off |
+| `RECIPES_WRITER_SERVERS`       | `playwright`             | Comma-separated servers; keys granted any of them (or admin) may save recipes |
+| `SKILLS_DIR`                   | `<repo>/skills`          | Skills (playbooks) directory |
+| `SKILLS_MATCH_THRESHOLD`       | `0.5`                    | Cosine similarity for matching a query to a skill (`related_skill`) |
 | `TOOL_RAG_CATALOG_LIST_TOOLS`  | `0`                      | `1` = `browse_tools` `category` also lists tools (≤25) for non-admin keys; default summaries only |
 | `TOOL_RAG_CATALOG_REFRESH_TIMEOUT` | `90`                 | Seconds budget for a catalog refresh's LLM calls; on timeout the previous catalog stays |
 | `TOOL_RAG_CATALOG_STRONG` / `_WEAK` | `0.45` / `0.3`      | Fallback coverage thresholds (no planner) on reranked scores |
