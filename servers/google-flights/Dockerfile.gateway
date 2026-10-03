@@ -1,0 +1,7 @@
+# Google Flights via fli (PyPI `flights`, reverse-engineered Google Flights; no API key).
+# `fli-mcp-http` serves Streamable HTTP on 0.0.0.0:8000 (HOST/PORT env override).
+FROM python:3.12-slim-bookworm
+ARG FLI_VERSION=0.9.0
+RUN pip install --no-cache-dir "flights[mcp]==${FLI_VERSION}"
+EXPOSE 8000
+CMD ["fli-mcp-http"]

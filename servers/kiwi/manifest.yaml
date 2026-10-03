@@ -1,0 +1,8 @@
+# Official Kiwi.com MCP server (hosted, no API key). Strong for unusual routes:
+# virtual interlining / self-transfer, different-airport connections, ±3 day flex.
+id: kiwi
+kind: remote
+transport: streamable_http
+url: "https://mcp.kiwi.com"
+description: "Kiwi.com flight search with self-transfer and multi-airline combinations, flexible dates and booking links."
+categories: [flight-search]

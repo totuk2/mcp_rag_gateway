@@ -1,0 +1,17 @@
+# flight-research: our own server (code in this dir). Aviation data (nearby airports from
+# OurAirports, airport routes/schedules from AeroDataBox) + research_route, which fans out
+# to the kiwi / google-flights / skiplagged / flights(Duffel) engines and combines legs.
+# Secrets come from the root .env. Without AERODATABOX_KEY it still works, inferring
+# hubs from engine results. Streamable HTTP :8000/mcp.
+id: flight-research
+kind: docker
+build: .
+port: 8000
+transport: streamable_http
+path: /mcp
+description: "Flight research for hard routes: nearby airports, what flies into an airport (routes, schedules), and multi-engine itinerary search with hub and self-transfer combinations."
+categories: [flight-search, aviation-data]
+env:
+  AERODATABOX_KEY: "${AERODATABOX_KEY}"
+  GOOGLE_FLIGHTS_MCP_URL: "http://google-flights:8000/mcp"
+  DUFFEL_MCP_URL: "http://flights:8000/mcp"

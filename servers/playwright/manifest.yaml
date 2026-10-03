@@ -1,0 +1,31 @@
+# Playwright MCP (microsoft/playwright-mcp, @playwright/mcp) — browser automation.
+# The image's ENTRYPOINT is `node /app/cli.js --headless --browser chromium --no-sandbox`,
+# which speaks stdio by default. We append --port/--host as flags (compose `command:` is
+# appended to the ENTRYPOINT) to flip it into Streamable HTTP on /mcp bound to all
+# interfaces, so the gateway can reach it at http://playwright:8931/mcp (compose service
+# name). This is the README's documented long-lived-service invocation. NB: the
+# PLAYWRIGHT_MCP_HOST env var is NOT honored by this version (the server still bound to
+# localhost) — only the explicit --host flag binds 0.0.0.0. The server also enforces
+# DNS-rebinding Host-header validation (defaults to the bound host), so it 403s the
+# gateway's `Host: playwright:8931` unless that host is allow-listed via --allowed-hosts.
+# Chromium-only; no secrets.
+#
+# --shared-browser-context: the gateway opens a FRESH upstream MCP session per tool call
+# (backends.open_upstream_session is stateless, no pooling). By default playwright-mcp gives
+# each session its own browser context, so browser_navigate (call 1) and
+# browser_take_screenshot (call 2) would land in different contexts → the screenshot
+# captures a blank page. Sharing one context across sessions lets a multi-call browser flow
+# carry state. Fine for a single-user homelab gateway; revisit if multiple clients drive the
+# browser concurrently (they'd then share one page/context).
+id: playwright
+kind: docker
+build: .
+port: 8931
+transport: streamable_http
+path: /mcp
+command: ["--port", "8931", "--host", "0.0.0.0", "--allowed-hosts", "playwright:8931", "--shared-browser-context"]
+# playwright-mcp ties the open page/tab to the MCP session, and the gateway normally opens a
+# fresh upstream session per call (browser_navigate then browser_snapshot -> about:blank).
+# stateful: the gateway keeps one upstream session per downstream MCP session (sticky,
+# closed on idle / session end), so multi-step browser flows keep their page.
+stateful: true

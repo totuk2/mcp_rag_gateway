@@ -1,0 +1,12 @@
+# Google Flights via fli (https://github.com/punitarani/fli, PyPI `flights[mcp]`):
+# reverse-engineered Google Flights, no API key. Our Dockerfile.gateway pins the
+# version; `fli-mcp-http` serves Streamable HTTP on 0.0.0.0:8000/mcp.
+id: google-flights
+kind: docker
+build: .
+dockerfile: Dockerfile.gateway
+port: 8000
+transport: streamable_http
+path: /mcp
+description: "Google Flights search: prices and itineraries for a route and date, cheapest-date calendars, airport lookup."
+categories: [flight-search]

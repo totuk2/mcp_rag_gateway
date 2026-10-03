@@ -1,0 +1,9 @@
+# Official Skiplagged MCP server (hosted, no API key): flights (incl. hidden-city and
+# virtual interlining), flexible fare calendars, "anywhere" discovery, hotels, cars.
+# Doesn't know every small airport (e.g. ALP).
+id: skiplagged
+kind: remote
+transport: streamable_http
+url: "https://mcp.skiplagged.com/mcp"
+description: "Skiplagged flight search with flexible fare calendars and destination discovery; also hotels and rental cars."
+categories: [flight-search]
