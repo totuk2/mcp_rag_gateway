@@ -7,7 +7,9 @@ free tier; every result reports how many API calls it spent.
 
 from __future__ import annotations
 
+import asyncio
 import os
+import time
 from datetime import date as Date, datetime, timedelta
 
 import httpx
@@ -17,6 +19,10 @@ from flight_research import cache
 HOST = os.environ.get("AERODATABOX_HOST", "aerodatabox.p.rapidapi.com")
 ROUTES_TTL = 7 * 24 * 3600
 SCHEDULE_TTL = 6 * 3600
+# RapidAPI plans are rate-limited (free tier ~1 request/s): space calls out and
+# retry 429s instead of firing research_route's lookups all at once.
+MIN_INTERVAL_S = float(os.environ.get("AERODATABOX_MIN_INTERVAL", "1.1"))
+RETRIES_429 = 3
 
 
 class AeroDataBoxError(RuntimeError):
@@ -27,6 +33,8 @@ class AeroDataBox:
     def __init__(self, key: str | None = None) -> None:
         self.key = key if key is not None else os.environ.get("AERODATABOX_KEY", "")
         self.calls = 0  # real (uncached) API calls since start
+        self._lock = asyncio.Lock()
+        self._last = 0.0
 
     @property
     def enabled(self) -> bool:
@@ -35,10 +43,23 @@ class AeroDataBox:
     async def _get(self, path: str, params: dict | None = None) -> dict:
         if not self.enabled:
             raise AeroDataBoxError("AERODATABOX_KEY is not configured")
-        self.calls += 1
-        async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.get(f"https://{HOST}{path}", params=params,
-                            headers={"X-RapidAPI-Key": self.key, "X-RapidAPI-Host": HOST})
+        async with self._lock:  # one request at a time, MIN_INTERVAL_S apart
+            for attempt in range(RETRIES_429 + 1):
+                wait = self._last + MIN_INTERVAL_S - time.monotonic()
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                self.calls += 1
+                async with httpx.AsyncClient(timeout=30) as c:
+                    r = await c.get(f"https://{HOST}{path}", params=params,
+                                    headers={"X-RapidAPI-Key": self.key, "X-RapidAPI-Host": HOST})
+                self._last = time.monotonic()
+                if r.status_code != 429 or attempt == RETRIES_429:
+                    break
+                try:
+                    backoff = min(float(r.headers.get("retry-after", "")), 10.0)
+                except ValueError:
+                    backoff = 1.5 * (attempt + 1)
+                await asyncio.sleep(backoff)
         if r.status_code == 204:
             return {}
         if r.status_code >= 400:
