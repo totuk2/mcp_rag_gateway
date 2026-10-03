@@ -47,6 +47,14 @@ done.
 4. **Ground options.** A nearby airport plus a bus/taxi can beat the direct airport.
    Always state the distance and whether a border crossing is involved.
 
+5. **Airline codes.** Many airlines fly under several IATA codes; filter with all of
+   them (`select_airlines`): Wizz Air `W6,W4,W9,5W` (W4 = Wizz Air Malta), Ryanair
+   group `FR,RK,AL,LW`, easyJet `U2,EC,DS`. When unsure, search unfiltered and read the
+   carriers in the results.
+6. **Does the leg exist?** Before reporting "no fares" for a requested direct leg, check
+   `flight-research__airport_routes` on one end. If it isn't served, say so and offer the
+   closest alternatives (same airline with a connection, or another airline).
+
 ## 3. Airline websites (last resort)
 
 For carriers in `manual_checks` (often small national or regional airlines), open the

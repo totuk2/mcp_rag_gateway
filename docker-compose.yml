@@ -14,6 +14,8 @@ services:
       - "${MCP_GATEWAY_PORT:-8765}:8765"
     volumes:
       - ./config:/app/config:ro
+      # Skills (playbooks) are read at startup: edit + restart, no rebuild.
+      - ./skills:/app/skills:ro
       # Persist the HuggingFace cache (local embedder + reranker models) so they
       # download once instead of on every container recreate.
       - hf-cache:/root/.cache/huggingface
