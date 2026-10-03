@@ -83,7 +83,8 @@ async def airport_schedule(iata: str, date: str, direction: str = "both") -> str
 @mcp.tool()
 async def research_route(origin: str, destination: str, date: str, flex_days: int = 2, adults: int = 1,
                          max_price_eur: float | None = None, dest_radius_km: float = 400,
-                         origin_radius_km: float = 200, allow_ground: bool = True) -> str:
+                         origin_radius_km: float = 200, allow_ground: bool = True,
+                         date_to: str | None = None) -> str:
     """Systematic flight research for hard routes, in one call (~30-75 s).
     Expands nearby airports around origin and destination, finds hubs that actually
     fly into the destination area, queries Kiwi.com, Google Flights, Skiplagged and
@@ -91,12 +92,15 @@ async def research_route(origin: str, destination: str, date: str, flex_days: in
     self-transfer options, and ranks them by price, time and risk.
     Returns `options` (ranked, with segments and booking links), `hubs`, `coverage`
     (what was searched / failed) and `manual_checks` (airlines on the last leg that no
-    engine priced — check their websites). `origin`/`destination`: IATA/metro code or
+    engine priced — check their websites). For a flexible window (e.g. "any day in
+    December") pass `date` = first day and `date_to` = last day: the whole-trip search
+    covers every day in the range in ONE call — prefer this over many calls with
+    different dates. `origin`/`destination`: IATA/metro code or
     city name in English or local spelling;
     `date`: YYYY-MM-DD."""
     try:
         return _json(await _research_route(origin, destination, date, flex_days, adults, max_price_eur,
-                                           dest_radius_km, origin_radius_km, allow_ground, adb))
+                                           dest_radius_km, origin_radius_km, allow_ground, adb, date_to))
     except ValueError as e:
         return _json({"error": str(e)})
 

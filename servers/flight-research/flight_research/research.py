@@ -110,11 +110,15 @@ class _Runner:
 async def research_route(origin: str, destination: str, day: str, flex_days: int = 2, adults: int = 1,
                          max_price_eur: float | None = None, dest_radius_km: float = 400,
                          origin_radius_km: float = 200, allow_ground: bool = True,
-                         adb: AeroDataBox | None = None) -> dict:
+                         adb: AeroDataBox | None = None, date_to: str | None = None) -> dict:
     t0 = time.monotonic()
     adb = adb or AeroDataBox()
     calls_before = adb.calls
     Date.fromisoformat(day)  # validate early
+    if date_to:
+        if Date.fromisoformat(date_to) < Date.fromisoformat(day):
+            return {"error": "date_to is before date"}
+        flex_days = 0
     o_hits, d_hits = airports.resolve(origin), airports.resolve(destination)
     if not o_hits or not d_hits:
         return {"error": f"unknown {'origin' if not o_hits else 'destination'}: {origin if not o_hits else destination!r}"}
@@ -157,14 +161,14 @@ async def research_route(origin: str, destination: str, day: str, flex_days: int
     # 3. Engine queries (whole trip + per-hub legs), all concurrent.
     nxt = (Date.fromisoformat(day) + timedelta(days=1)).isoformat()
     whole = [
-        runner.run("kiwi", f"{','.join(O_set)}→{D.iata} ±{flex_days}d", engines.kiwi, O_set, [D.iata], day, flex_days, adults, True),
+        runner.run("kiwi", f"{','.join(O_set)}→{D.iata} {day}..{date_to or f'±{flex_days}d'}", engines.kiwi, O_set, [D.iata], day, flex_days, adults, True, date_to),
         runner.run("google", f"{O.iata}→{D.iata}", engines.google, [O.iata], [D.iata], day, adults),
         runner.run("skiplagged", f"{O.iata}→{D.iata}", engines.skiplagged, O.iata, D.iata, day, adults),
         runner.run("duffel", f"{O.iata}→{D.iata}", engines.duffel, O.iata, D.iata, day, adults),
     ]
     if len(D_set) > 1:
         whole += [
-            runner.run("kiwi", f"{','.join(O_set)}→{','.join(D_set[1:])} ±{flex_days}d", engines.kiwi, O_set, D_set[1:], day, flex_days, adults, True),
+            runner.run("kiwi", f"{','.join(O_set)}→{','.join(D_set[1:])} {day}..{date_to or f'±{flex_days}d'}", engines.kiwi, O_set, D_set[1:], day, flex_days, adults, True, date_to),
             runner.run("google", f"{','.join(O_set)}→{','.join(D_set[1:])}", engines.google, O_set, D_set[1:], day, adults),
         ]
     whole_results = await asyncio.gather(*whole) if not top_hubs else None
@@ -296,7 +300,8 @@ async def research_route(origin: str, destination: str, day: str, flex_days: int
     return {
         # Compact digest first: survives truncation and is what an agent should read.
         "summary": [line(o) for o in options[:10]] or ["no priced options"],
-        "query": {"origin": origin, "destination": destination, "date": day, "flex_days": flex_days, "adults": adults},
+        "query": {"origin": origin, "destination": destination, "date": day, "date_to": date_to,
+                  "flex_days": flex_days, "adults": adults},
         "origin": O.brief(), "destination": D.brief(),
         "origin_alternatives": [{**a.brief(), "km": round(km)} for a, km in o_alts],
         "destination_alternatives": [{**a.brief(), "km": round(km)} for a, km in d_alts],

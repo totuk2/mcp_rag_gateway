@@ -11,9 +11,11 @@ URLs are env-configurable; an engine whose URL is empty is skipped.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
+import time
 from datetime import date as Date
 
 import httpx
@@ -30,6 +32,11 @@ URLS = {
     "duffel": os.environ.get("DUFFEL_MCP_URL", "http://flights:8000/mcp"),
 }
 ENGINE_TIMEOUT = float(os.environ.get("ENGINE_TIMEOUT", "45"))
+# Identical engine queries within this window share one upstream call: parallel
+# research_route runs (e.g. Poland -> Amman / Beirut / Damascus) overlap heavily.
+CACHE_TTL_S = float(os.environ.get("ENGINE_CACHE_TTL", "900"))
+_cache: dict[str, tuple[float, str]] = {}
+_inflight: dict[str, asyncio.Future] = {}
 
 
 class EngineError(RuntimeError):
@@ -37,6 +44,34 @@ class EngineError(RuntimeError):
 
 
 async def call_mcp(url: str, tool: str, args: dict) -> str:
+    """Cached + de-duplicated engine call (see CACHE_TTL_S)."""
+    key = json.dumps([url, tool, args], sort_keys=True)
+    hit = _cache.get(key)
+    if hit and time.monotonic() - hit[0] < CACHE_TTL_S:
+        return hit[1]
+    if key in _inflight:
+        return await asyncio.shield(_inflight[key])
+    fut = asyncio.get_running_loop().create_future()
+    _inflight[key] = fut
+    try:
+        text = await _call_mcp(url, tool, args)
+    except BaseException as e:
+        if not fut.done():
+            fut.set_exception(e)
+            fut.exception()  # mark retrieved; waiters re-raise it
+        raise
+    else:
+        _cache[key] = (time.monotonic(), text)
+        if len(_cache) > 2000:
+            for k in sorted(_cache, key=lambda k: _cache[k][0])[:500]:
+                del _cache[k]
+        fut.set_result(text)
+        return text
+    finally:
+        _inflight.pop(key, None)
+
+
+async def _call_mcp(url: str, tool: str, args: dict) -> str:
     """One fresh MCP session per call (engines are stateless); returns the text content."""
     async with create_mcp_http_client({}, httpx.Timeout(20.0, read=ENGINE_TIMEOUT)) as hc:
         async with streamable_http_client(url, http_client=hc) as (read, write, _):
@@ -56,14 +91,19 @@ def _seg(frm, to, dep, arr, carrier, flight) -> dict:
 # ---------------------------------------------------------------- Kiwi.com
 
 async def kiwi(origins: list[str], destinations: list[str], day: str, flex_days: int = 0,
-               adults: int = 1, diff_airport: bool = False) -> list[dict]:
+               adults: int = 1, diff_airport: bool = False, day_to: str | None = None) -> list[dict]:
     d = Date.fromisoformat(day)
-    text = await call_mcp(URLS["kiwi"], "search-flight", {
+    args = {
         "flyFrom": ",".join(origins), "flyTo": ",".join(destinations),
-        "departureDate": f"{d:%d/%m/%Y}", "departureDateFlexDays": max(0, min(flex_days, 3)),
+        "departureDate": f"{d:%d/%m/%Y}",
         "adults": adults, "currency": "EUR", "locale": "en", "sort": "price",
         "allow_self_transfer": True, "allow_diff_airport_connection": diff_airport,
-    })
+    }
+    if day_to:  # a whole date range in one query (Kiwi searches every day in it)
+        args["departureDateTo"] = f"{Date.fromisoformat(day_to):%d/%m/%Y}"
+    else:
+        args["departureDateFlexDays"] = max(0, min(flex_days, 3))
+    text = await call_mcp(URLS["kiwi"], "search-flight", args)
     try:
         data = json.loads(text)
     except json.JSONDecodeError as e:
