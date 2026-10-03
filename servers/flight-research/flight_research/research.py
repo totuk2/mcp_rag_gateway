@@ -39,6 +39,19 @@ PER_100KM_GROUND = 35.0
 BORDER_CROSSING = 80.0  # ground leg into another country (visas, closures, time)
 # Ranked list diversity: at most this many options per (arrival airport, last hub).
 PER_PATTERN = 2
+# Country pairs whose land border is closed: an airport across it is no alternative
+# for ground transfer. ISO-3166 alpha-2 pairs, order-insensitive; override with
+# CLOSED_LAND_BORDERS="IL-SY,IL-LB,..." (empty string disables).
+CLOSED_BORDERS = {
+    frozenset(p.split("-")) for p in os.environ.get(
+        "CLOSED_LAND_BORDERS", "IL-SY,IL-LB,AM-TR,AM-AZ,KP-KR,IL-IQ,IL-IR"
+    ).split(",") if "-" in p
+}
+# Island states with no road link to other countries: their airports are no ground
+# alternative for a destination abroad (and vice versa). NO_LAND_LINK_COUNTRIES overrides.
+NO_LAND_LINK = set(filter(None, os.environ.get(
+    "NO_LAND_LINK_COUNTRIES", "CY,MT,IS,MV,MU,SC,CV,LK,NZ,JP,TW,PH,ID,CU,JM,FJ"
+).split(",")))
 
 
 def _parse(t: str | None) -> datetime | None:
@@ -107,7 +120,10 @@ async def research_route(origin: str, destination: str, day: str, flex_days: int
         return {"error": f"unknown {'origin' if not o_hits else 'destination'}: {origin if not o_hits else destination!r}"}
     O, D = o_hits[0], d_hits[0]
     o_alts = [(a, km) for a, km in airports.nearby(O, origin_radius_km) if a.type != "small_airport"][:3]
-    d_alts = airports.nearby(D, dest_radius_km)[:6] if allow_ground else []
+    d_alts = [(a, km) for a, km in airports.nearby(D, dest_radius_km)
+              if a.country == D.country or (frozenset((a.country, D.country)) not in CLOSED_BORDERS
+                                            and a.country not in NO_LAND_LINK and D.country not in NO_LAND_LINK)
+              ][:6] if allow_ground else []
     O_set = [O.iata] + [a.iata for a, _ in o_alts]
     D_set = [D.iata] + [a.iata for a, _ in d_alts]
     ground_km = {D.iata: 0.0, **{a.iata: round(km) for a, km in d_alts}}

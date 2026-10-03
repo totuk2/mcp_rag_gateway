@@ -101,13 +101,26 @@ def resolve(location: str) -> list[Airport]:
     return sorted(partial, key=_rank)[:10]
 
 
+_GENERIC = {"airport", "international", "intl", "aeroport", "aeropuerto", "aeroporto", "flughafen", "the", "of"}
+
+
+def _tokens(s: str) -> set[str]:
+    return {t for t in _norm(s).split() if t not in _GENERIC}
+
+
 def code_for_name(name: str) -> str:
-    """Best-effort IATA for an airport *name* (Google Flights legs carry names only)."""
+    """Best-effort IATA for an airport *name* (Google Flights legs carry names only).
+    Exact normalized name, else substring, else all significant words contained
+    ("Ben Gurion Airport" -> "Ben Gurion International Airport")."""
     load()
     key = _norm(name)
     if (ap := _by_name.get(key)):
         return ap.iata
     hits = [a for a in _all if a.scheduled and (key in _norm(a.name) or _norm(a.name) in key)]
+    if not hits and (toks := _tokens(name)):
+        hits = [a for a in _all if a.scheduled and toks <= _tokens(a.name)]
+        if not hits:  # the query has extra words ("... Kraków Balice ...")
+            hits = [a for a in _all if a.scheduled and len(_tokens(a.name)) >= 2 and _tokens(a.name) <= toks]
     return sorted(hits, key=_rank)[0].iata if hits else name
 
 
