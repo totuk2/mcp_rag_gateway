@@ -30,6 +30,7 @@ from gateway.tool_record import ToolRecord
 if TYPE_CHECKING:
     from gateway.health import ServerHealth
     from gateway.policy import AccessPolicy
+    from gateway.skills import SkillStore
     from tool_rag.planner import Planner
     from tool_rag.retriever import Retriever
 
@@ -74,8 +75,10 @@ def _teaser(text: str, cap: int) -> str:
 
 class ToolCatalog:
     def __init__(self, tool_db: ToolDb, server_health: "ServerHealth | None" = None,
-                 retriever: "Retriever | None" = None, planner: "Planner | None" = None) -> None:
+                 retriever: "Retriever | None" = None, planner: "Planner | None" = None,
+                 skills: "SkillStore | None" = None) -> None:
         self._tool_db = tool_db
+        self._skills = skills
         self._server_health = server_health
         self._retriever = retriever
         self._planner = planner
@@ -144,7 +147,10 @@ class ToolCatalog:
             }
             for c in sorted(cat_tools, key=lambda c: (-cat_tools[c], c))
         ]
-        return {"total_tools": len(tools), "domains": domains, "categories": categories}
+        out = {"total_tools": len(tools), "domains": domains, "categories": categories}
+        if self._skills:
+            out["skills"] = [s.brief() for s in self._skills.visible(policy)]
+        return out
 
     def category(self, policy: "AccessPolicy | None", name: str) -> dict[str, Any]:
         """One category — or one domain, since agents often ask by server name."""
@@ -231,6 +237,10 @@ class ToolCatalog:
             domains = list(dict.fromkeys(m["domain"] for m in matches))
             categories = list(dict.fromkeys(c for m in matches for c in m["categories"]))
             out.update({"verdict": verdict, "verdict_source": "scores"})
+        if self._skills:
+            hits = await self._skills.match(query, policy)
+            if hits:
+                out["related_skill"] = hits[0][0].brief()
         search = out.get("suggested_query") or query
         out.update({
             "domains": domains,
@@ -280,6 +290,8 @@ class ToolCatalog:
         head = f"Your catalog: {ov['total_tools']} tools in {len(ov['domains'])} domains. "
         cats = ", ".join(f"{c['name']} ({c['tool_count']})" for c in ov["categories"])
         cats_part = f" Categories: {cats}." if cats else ""
+        if ov.get("skills"):
+            cats_part += " Playbooks (get_skill): " + ", ".join(s["name"] for s in ov["skills"]) + "."
         for desc_cap in (70, 35, 0):  # shrink descriptions before dropping domains
             items = [
                 f"{d['domain']} ({d['tool_count']})" + (f" — {_teaser(d['description'], desc_cap)}"

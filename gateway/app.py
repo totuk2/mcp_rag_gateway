@@ -19,6 +19,9 @@ from gateway.health import ServerHealth, health_loop
 from gateway.index_publisher import IndexPublisher
 from gateway.registry import Registry, load_registries, load_registry
 from gateway.server import build_gateway_server
+from gateway.session_pool import StickySessionPool
+from gateway.recipes import RecipeStore
+from gateway.skills import SkillStore
 from gateway.sync_adapter import SyncAdapter
 from gateway.tool_db import ToolDb
 from tool_rag.catalog import ToolCatalog
@@ -140,8 +143,10 @@ async def resync_loop(registry, tool_db, indexer, interval, planner=None):
             logger.exception("Background resync failed")
 
 
-def build_starlette_app(registry, key_store, mcp_path=DEFAULT_MCP_PATH, tool_rag_enabled=False, tool_db=None, tool_rag_router=None, server_health=None, retriever=None, anon_policy=None, planner=None, max_parallel=8, catalog=None):
-    mcp = build_gateway_server(registry, retriever=retriever, planner=planner, max_parallel=max_parallel, catalog=catalog)
+def build_starlette_app(registry, key_store, mcp_path=DEFAULT_MCP_PATH, tool_rag_enabled=False, tool_db=None, tool_rag_router=None, server_health=None, retriever=None, anon_policy=None, planner=None, max_parallel=8, catalog=None, skills=None, recipes=None):
+    # Sticky upstream sessions for servers flagged `stateful` (e.g. Playwright).
+    session_pool = StickySessionPool() if any(c.stateful for c in registry.servers.values()) else None
+    mcp = build_gateway_server(registry, retriever=retriever, planner=planner, max_parallel=max_parallel, catalog=catalog, skills=skills, recipes=recipes, session_pool=session_pool)
     session_manager = StreamableHTTPSessionManager(app=mcp, stateless=False, json_response=False)
     streamable_http_app = StreamableHTTPASGIApp(session_manager)
     is_tr = tool_rag_enabled and tool_rag_router is not None
@@ -198,6 +203,8 @@ def build_starlette_app(registry, key_store, mcp_path=DEFAULT_MCP_PATH, tool_rag
                     await asyncio.gather(*tasks, return_exceptions=True)
                 if retriever is not None:
                     await retriever.aclose()
+                if session_pool is not None:
+                    await session_pool.aclose()
 
     routes = [
         Route("/health", health, methods=["GET"]),
@@ -234,6 +241,8 @@ def app_from_env():
     retriever = None
     planner = None
     catalog = None
+    skills = None
+    recipes = None
     try:
         max_parallel = int(os.environ.get("TOOL_RAG_MAX_PARALLEL", "8"))
     except ValueError:
@@ -251,7 +260,10 @@ def app_from_env():
         reranker = create_reranker()
         planner = create_planner()
         retriever = Retriever(embedder, indexer, tool_db, server_health=server_health, reranker=reranker)
-        catalog = ToolCatalog(tool_db, server_health=server_health, retriever=retriever, planner=planner)
+        skills = SkillStore(embedder=embedder)
+        if os.environ.get("RECIPES_ENABLED", "1").lower() in ("1", "true", "on"):
+            recipes = RecipeStore(tool_db)
+        catalog = ToolCatalog(tool_db, server_health=server_health, retriever=retriever, planner=planner, skills=skills)
         tool_rag_router = ToolRagRouter(
             tool_db, embedder, indexer, retriever, server_health=server_health,
             catalog=catalog, registry=registry, planner=planner,
@@ -262,4 +274,4 @@ def app_from_env():
         logger.warning("GATEWAY_ANON_KEY=%r not found in keys.yaml; anonymous access disabled", anon_key_id)
     elif anon_policy is not None:
         logger.info("Anonymous access enabled via key_id=%s (GATEWAY_ANON_KEY)", anon_policy.key_id)
-    return build_starlette_app(registry, key_store, mcp_path=mcp_path, tool_rag_enabled=tool_rag_enabled, tool_db=tool_db, tool_rag_router=tool_rag_router, server_health=server_health, retriever=retriever, anon_policy=anon_policy, planner=planner, max_parallel=max_parallel, catalog=catalog)
+    return build_starlette_app(registry, key_store, mcp_path=mcp_path, tool_rag_enabled=tool_rag_enabled, tool_db=tool_db, tool_rag_router=tool_rag_router, server_health=server_health, retriever=retriever, anon_policy=anon_policy, planner=planner, max_parallel=max_parallel, catalog=catalog, skills=skills, recipes=recipes)

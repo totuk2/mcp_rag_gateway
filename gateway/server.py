@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import weakref
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
@@ -25,10 +26,14 @@ from gateway.merge import (
     parse_gateway_resource_uri,
     split_merged_name,
 )
+from gateway.recipes import RecipeError, RecipeStore, site_of, urls_in
 from gateway.registry import Registry
+from tool_rag.agent import AgentTool, agent_enabled, run_agent
 
 if TYPE_CHECKING:
     from gateway.policy import AccessPolicy
+    from gateway.session_pool import StickySessionPool
+    from gateway.skills import SkillStore
     from tool_rag.catalog import ToolCatalog
     from tool_rag.retriever import Retriever
     from tool_rag.planner import Planner
@@ -38,6 +43,9 @@ logger = logging.getLogger(__name__)
 # Per-session discovered tools: session object → {merged_tool_name: types.Tool}
 # WeakKeyDictionary auto-cleans when the session is GC'd (session ends/times out).
 _session_tools: weakref.WeakKeyDictionary[Any, dict[str, types.Tool]] = weakref.WeakKeyDictionary()
+
+# Per-session sites whose recipes were already injected (inject once per site).
+_session_recipe_sites: weakref.WeakKeyDictionary[Any, set[str]] = weakref.WeakKeyDictionary()
 
 # Name of the always-listed meta-tool that exposes Tool-RAG discovery in-band.
 # Has no "__" so it never collides with a merged {server_id}__{tool} name.
@@ -62,6 +70,17 @@ PLAN_TOOL_NAME = "plan"
 # Catalog meta-tool: general questions about what's available (domains,
 # categories, "do I have tools for X?"). Listed when a catalog is wired up.
 BROWSE_TOOLS_NAME = "browse_tools"
+
+# Skills: markdown playbooks (skills/<name>/SKILL.md) fetched on demand.
+GET_SKILL_NAME = "get_skill"
+
+# Sub-agent: the gateway runs a whole multi-step task with the planner model
+# (TOOL_RAG_AGENT=on + planner configured). See tool_rag/agent.py.
+DELEGATE_NAME = "delegate"
+
+# Site recipes: procedural memory for browser automation (gateway/recipes.py).
+GET_SITE_RECIPES_NAME = "get_site_recipes"
+SAVE_SITE_RECIPE_NAME = "save_site_recipe"
 
 # Default cap on concurrent upstream calls in run_tools (overridable per call and
 # via TOOL_RAG_MAX_PARALLEL). Bounds stdio subprocess spawns / upstream load.
@@ -130,7 +149,8 @@ def _shortlist_description(text: str) -> str:
     return cut.rstrip() + "…"
 
 
-def _gateway_instructions(planner_on: bool, catalog_on: bool = False) -> str:
+def _gateway_instructions(planner_on: bool, catalog_on: bool = False, skills_on: bool = False,
+                          agent_on: bool = False, recipes_on: bool = False) -> str:
     """MCP `initialize` instructions; surfaced so the agent knows the catalog is
     hidden and how to discover/execute tools. Only set when Tool-RAG is on."""
     base = (
@@ -151,6 +171,24 @@ def _gateway_instructions(planner_on: bool, catalog_on: bool = False) -> str:
             f"whether anything covers a problem — call `{BROWSE_TOOLS_NAME}` (no arguments "
             f"for an overview, `category` for one category or domain, `query` to check "
             f"coverage of a problem) before `{FIND_TOOLS_NAME}`."
+        )
+    if skills_on:
+        base += (
+            f" Some task types have playbooks: when a response mentions a `related_skill`, "
+            f"call `{GET_SKILL_NAME}` and follow it — it says which tools to use and what to "
+            f"try when the first attempt finds nothing. Don't give up after one empty search."
+        )
+    if recipes_on:
+        base += (
+            f" Before automating a website with a browser, call `{GET_SITE_RECIPES_NAME}` for it "
+            f"(saved recipes are also appended automatically when you navigate to a known site). "
+            f"After you successfully get the data from a site, call `{SAVE_SITE_RECIPE_NAME}` "
+            f"with the URL pattern and steps that worked, so the next visit is fast."
+        )
+    if agent_on:
+        base += (
+            f" For long research tasks you can hand the whole task to `{DELEGATE_NAME}`, which "
+            f"runs it with tools on the gateway side and returns the result (may take minutes)."
         )
     if planner_on:
         base += (
@@ -386,19 +424,110 @@ def _browse_tools_definition(summary: str) -> types.Tool:
     )
 
 
+def _get_skill_definition(skills: list[dict[str, str]]) -> types.Tool:
+    """Playbook fetch; lists the key's visible skills in the description."""
+    listing = "; ".join(f"`{s['name']}` — {s['description']}" for s in skills)
+    return types.Tool(
+        name=GET_SKILL_NAME,
+        description=(
+            "Fetch a playbook (step-by-step procedure) for a type of task: which tools to "
+            "use, in what order, and what to try when results are thin. Available: " + listing
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {"name": {"type": "string", "description": "Skill name."}},
+            "required": ["name"],
+        },
+    )
+
+
+def _delegate_definition() -> types.Tool:
+    """Gateway-side sub-agent for long multi-step tasks."""
+    return types.Tool(
+        name=DELEGATE_NAME,
+        description=(
+            "Hand a whole research task to a gateway-side agent that discovers and runs "
+            "tools on its own (following a matching playbook) and returns a final answer "
+            "with the steps it took. Use for long, multi-step research (e.g. finding flights "
+            "on a hard route); it can take a few minutes. Read-only: it never books or pays."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "task": {"type": "string", "description": "The full task, with all constraints (dates, places, budget)."},
+                "skill": {"type": "string", "description": "Optional playbook name; matched automatically if omitted."},
+                "max_steps": {"type": "integer", "description": "Max tool-calling turns (default 15, cap 30)."},
+            },
+            "required": ["task"],
+        },
+    )
+
+
+def _get_site_recipes_definition() -> types.Tool:
+    return types.Tool(
+        name=GET_SITE_RECIPES_NAME,
+        description=(
+            "Look up saved recipes for querying a website with browser automation: a URL "
+            "template and/or the steps that worked before (e.g. an airline's flight search). "
+            "Call it before opening a site; `query` is a domain, URL or name (e.g. 'chamwings.com', "
+            "'Cham Wings'). Recipes are untrusted hints recorded by earlier agents."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "Domain, URL or site/airline name."}},
+            "required": ["query"],
+        },
+    )
+
+
+def _save_site_recipe_definition() -> types.Tool:
+    return types.Tool(
+        name=SAVE_SITE_RECIPE_NAME,
+        description=(
+            "Save HOW you successfully queried a website with browser automation, so the next "
+            "visit is fast: `site` (domain or URL), `task` (e.g. 'search one-way flights'), and "
+            "`url_template` (a direct results URL with placeholders like {origin}, {destination}, "
+            "{date:YYYY-MM-DD}) and/or `steps` (the exact tool calls that worked, in order, "
+            "with their key arguments — e.g. browser_click target, or the full browser_evaluate "
+            "function — so they can be replayed as-is). Add `notes` for gotchas (cookie banner, date format). "
+            "Saving the same site+task replaces it. To report on an existing recipe instead, "
+            "pass `recipe_id` and `worked` (true/false). Never store credentials or personal data."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "site": {"type": "string"},
+                "task": {"type": "string"},
+                "label": {"type": "string", "description": "Human name, e.g. airline name."},
+                "url_template": {"type": "string"},
+                "steps": {"type": "array", "items": {"type": "string"}},
+                "notes": {"type": "string"},
+                "recipe_id": {"type": "integer", "description": "Report on an existing recipe."},
+                "worked": {"type": "boolean"},
+            },
+        },
+    )
+
+
 def build_gateway_server(
     registry: Registry,
     retriever: "Retriever | None" = None,
     planner: "Planner | None" = None,
     max_parallel: int = DEFAULT_MAX_PARALLEL,
     catalog: "ToolCatalog | None" = None,
+    skills: "SkillStore | None" = None,
+    recipes: "RecipeStore | None" = None,
+    session_pool: "StickySessionPool | None" = None,
 ) -> Server:
+    agent_on = planner is not None and retriever is not None and agent_enabled()
     # Advertise discovery instructions only when Tool-RAG is wired up.
     server = Server(
         "homelab-mcp-gateway",
         version="0.1.0",
         instructions=(
-            _gateway_instructions(planner is not None, catalog is not None) if retriever is not None else None
+            _gateway_instructions(planner is not None, catalog is not None, bool(skills), agent_on,
+                                  recipes is not None)
+            if retriever is not None else None
         ),
     )
 
@@ -552,9 +681,218 @@ def build_gateway_server(
             "instructions": instructions,
             "fallback_used": fallback_used,
         }
+        if skills:
+            hits = await skills.match(query, policy)
+            if hits:
+                payload["related_skill"] = hits[0][0].brief()
+                payload["instructions"] += (
+                    f" A playbook exists for this kind of task: call `{GET_SKILL_NAME}` with "
+                    f'{{"name": "{hits[0][0].name}"}} and follow it.'
+                )
         return types.CallToolResult(
             content=[types.TextContent(type="text", text=json.dumps(payload))]
         )
+
+    async def handle_get_skill(arguments: dict[str, Any] | None) -> types.CallToolResult:
+        """Return a playbook visible to this key."""
+        if not skills:
+            return _err_tool("No skills are configured on this gateway.")
+        name = (arguments or {}).get("name")
+        if not name or not isinstance(name, str):
+            return _err_tool("get_skill requires a string `name`.")
+        skill = skills.get(name, get_policy())
+        if skill is None:
+            avail = ", ".join(s.name for s in skills.visible(get_policy())) or "none"
+            return _err_tool(f"Unknown skill {name!r}. Available: {avail}.")
+        return types.CallToolResult(content=[types.TextContent(
+            type="text", text=f"# Skill: {skill.name}\n\n{skill.body}")])
+
+    def _agent_tools() -> list[AgentTool]:
+        """Tools for the delegate sub-agent: the meta-tool cores, run inside the
+        caller's request (same policy checks as direct calls). No nested delegate."""
+        async def find(args: dict[str, Any]) -> str:
+            q = args.get("query")
+            if not isinstance(q, str) or not q:
+                return "ERROR: find_tools needs a `query` string."
+            res, _ = await _gather_candidates(q, int(args.get("top_k") or 6))
+            for r in res:
+                r["description"] = _shortlist_description(r["description"])
+            return json.dumps(res, ensure_ascii=False)
+
+        async def describe(args: dict[str, Any]) -> str:
+            res = await handle_describe_tool(args)
+            text = "\n".join(c.text for c in res.content if isinstance(c, types.TextContent))
+            return f"ERROR: {text}" if res.isError else text
+
+        async def run(args: dict[str, Any]) -> str:
+            name = args.get("call_name")
+            if not isinstance(name, str) or name in _META_TOOL_NAMES:
+                return "ERROR: run_tool needs the `call_name` of an upstream tool from find_tools."
+            tool_args = args.get("arguments") or {}
+            if not isinstance(tool_args, dict):
+                return "ERROR: `arguments` must be an object."
+            res = await _dispatch_tool(name, tool_args)
+            text = "\n".join(c.text for c in res.content if isinstance(c, types.TextContent))
+            if res.isError:
+                return f"ERROR: {text or 'tool returned an error'}"
+            # Text once (FastMCP also mirrors it into structuredContent — don't send both).
+            return text or json.dumps(res.structuredContent, ensure_ascii=False)
+
+        async def skill(args: dict[str, Any]) -> str:
+            res = await handle_get_skill(args)
+            text = "\n".join(c.text for c in res.content if isinstance(c, types.TextContent))
+            return f"ERROR: {text}" if res.isError else text
+
+        async def via(handler, args: dict[str, Any]) -> str:
+            res = await handler(args)
+            text = "\n".join(c.text for c in res.content if isinstance(c, types.TextContent))
+            return f"ERROR: {text}" if res.isError else text
+
+        obj = {"type": "object"}
+        extra: list[AgentTool] = []
+        if recipes is not None:
+            extra.append(AgentTool(
+                "get_site_recipes", "Saved recipes (URL template / steps) for querying a website; call before browsing a site.",
+                {**obj, "properties": {"query": {"type": "string"}}, "required": ["query"]},
+                lambda a: via(handle_get_site_recipes, a)))
+            if recipes.can_write(get_policy()):
+                extra.append(AgentTool(
+                    "save_site_recipe", _save_site_recipe_definition().description or "",
+                    _save_site_recipe_definition().inputSchema, lambda a: via(handle_save_site_recipe, a)))
+        return extra + [
+            AgentTool("find_tools", "Find tools for a capability (natural-language query). Returns call_name, description, input_schema.",
+                      {**obj, "properties": {"query": {"type": "string"}, "top_k": {"type": "integer"}}, "required": ["query"]}, find),
+            AgentTool("describe_tool", "Full input_schema and description of one tool.",
+                      {**obj, "properties": {"call_name": {"type": "string"}}, "required": ["call_name"]}, describe),
+            AgentTool("run_tool", "Execute a tool by call_name with arguments matching its input_schema.",
+                      {**obj, "properties": {"call_name": {"type": "string"}, "arguments": {"type": "object"}},
+                       "required": ["call_name", "arguments"]}, run),
+            AgentTool("get_skill", "Fetch a playbook by name.",
+                      {**obj, "properties": {"name": {"type": "string"}}, "required": ["name"]}, skill),
+        ]
+
+    async def handle_delegate(arguments: dict[str, Any] | None) -> types.CallToolResult:
+        """Run a whole task with the gateway-side sub-agent (tool_rag/agent.py)."""
+        if not agent_on:
+            return _err_tool("The delegate agent is not enabled on this gateway.")
+        args = arguments or {}
+        task = args.get("task")
+        if not task or not isinstance(task, str):
+            return _err_tool("delegate requires a non-empty string `task`.")
+        policy = get_policy()
+        if not policy.servers:
+            return _err_tool("No servers are granted to this API key.")
+        chosen = None
+        if skills:
+            if isinstance(args.get("skill"), str) and args["skill"]:
+                chosen = skills.get(args["skill"], policy)
+            else:
+                hits = await skills.match(task, policy)
+                chosen = hits[0][0] if hits else None
+        try:
+            max_steps = int(args.get("max_steps") or 15)
+        except (TypeError, ValueError):
+            max_steps = 15
+
+        progress = None
+        try:
+            ctx = server.request_context
+            token = ctx.meta.progressToken if ctx.meta else None
+        except LookupError:
+            token = None
+        if token is not None:
+            async def progress(done: int, total: int, message: str) -> None:
+                try:
+                    await ctx.session.send_progress_notification(token, done, total, message)
+                except Exception:
+                    logger.debug("progress notification failed", exc_info=True)
+
+        # Recipes for sites the task names go into the prompt up front (and count as
+        # shown for this session, so they aren't injected again on navigate).
+        site_ctx = None
+        if recipes is not None:
+            named = {s for d in re.findall(r"[A-Za-z0-9.-]+\.[A-Za-z]{2,}", task) if (s := site_of(d))}
+            found = [r for s in sorted(named) for r in recipes.find(s)]
+            if found:
+                _mark_recipes_shown({r["site"] for r in found})
+                site_ctx = RecipeStore.as_context(found)
+        result = await run_agent(planner, task, _agent_tools(), chosen.body if chosen else None,
+                                 chosen.name if chosen else None, max_steps, progress, site_ctx)
+        logger.info("delegate: %s after %d tool calls (skill=%s)", result.stopped_reason, len(result.steps), result.skill)
+        return types.CallToolResult(content=[types.TextContent(
+            type="text", text=json.dumps(result.to_dict(), ensure_ascii=False))])
+
+    async def handle_get_site_recipes(arguments: dict[str, Any] | None) -> types.CallToolResult:
+        if recipes is None:
+            return _err_tool("Site recipes are not enabled on this gateway.")
+        q = (arguments or {}).get("query")
+        if not q or not isinstance(q, str):
+            return _err_tool("get_site_recipes requires a string `query`.")
+        found = recipes.find(q)
+        if found:
+            _mark_recipes_shown({r["site"] for r in found})
+            text = RecipeStore.as_context(found)
+        else:
+            text = (f"No saved recipe for {q!r}. Explore the site; once you get the data, save how "
+                    f"with `{SAVE_SITE_RECIPE_NAME}`.")
+        return types.CallToolResult(content=[types.TextContent(type="text", text=text)])
+
+    async def handle_save_site_recipe(arguments: dict[str, Any] | None) -> types.CallToolResult:
+        if recipes is None:
+            return _err_tool("Site recipes are not enabled on this gateway.")
+        a = arguments or {}
+        policy = get_policy()
+        try:
+            if a.get("recipe_id") is not None and not a.get("steps") and not a.get("url_template"):
+                rec = recipes.report(policy, int(a["recipe_id"]), bool(a.get("worked", True)))
+                msg = "Recorded."
+            else:
+                steps = a.get("steps")
+                if isinstance(steps, str):
+                    steps = [steps]
+                rec = recipes.save(policy, str(a.get("site") or ""), str(a.get("task") or ""), steps,
+                                   str(a.get("url_template") or ""), str(a.get("label") or ""),
+                                   str(a.get("notes") or ""))
+                msg = "Saved; it will be shown the next time an agent visits this site."
+        except (RecipeError, ValueError, TypeError) as e:
+            return _err_tool(f"Not saved: {e}")
+        logger.info("site recipe %s: %s / %s by %s", rec["id"], rec["site"], rec["task"], policy.key_id)
+        return types.CallToolResult(content=[types.TextContent(
+            type="text", text=json.dumps({"message": msg, "recipe": RecipeStore.brief(rec)}, ensure_ascii=False))])
+
+    def _mark_recipes_shown(sites: set[str]) -> set[str]:
+        """Record sites whose recipes this session has seen; returns the ones that are new."""
+        try:
+            seen = _session_recipe_sites.setdefault(server.request_context.session, set())
+        except LookupError:
+            return set(sites)
+        new = set(sites) - seen
+        seen.update(sites)
+        return new
+
+    def _with_recipes(res: types.CallToolResult, arguments: dict[str, Any] | None) -> types.CallToolResult:
+        """Append saved recipes for any site this successful call just touched (once per session)."""
+        if recipes is None or res.isError:
+            return res
+        sites = {s for u in urls_in(arguments) if (s := site_of(u))}
+        new = _mark_recipes_shown(sites) if sites else set()
+        if not new:
+            return res
+        extra: list[types.TextContent] = []
+        found = [r for site in sorted(new) for r in recipes.find(site)]
+        if found:
+            extra.append(types.TextContent(type="text", text=RecipeStore.as_context(found)))
+        unknown = sorted(new - {r["site"] for r in found})
+        if unknown and recipes.can_write(get_policy()):
+            # Nudge (once per session per site): the agent is the one who learns how the
+            # site works, so ask it to record that once it has the data.
+            extra.append(types.TextContent(type="text", text=(
+                f"[No saved recipe for {', '.join(unknown)} yet. Once you have the data you came for, "
+                f"call `{SAVE_SITE_RECIPE_NAME}` with the URL pattern and steps that worked, so the "
+                f"next visit is fast.]")))
+        if not extra:
+            return res
+        return res.model_copy(update={"content": [*res.content, *extra]})
 
     async def handle_browse_tools(arguments: dict[str, Any] | None) -> types.CallToolResult:
         """Catalog questions: overview / one category or domain / coverage of a
@@ -604,6 +942,15 @@ def build_gateway_server(
             ]
             if catalog is not None:
                 base.append(_browse_tools_definition(catalog.summary_text(policy)))
+            visible_skills = skills.visible(policy) if skills else []
+            if visible_skills:
+                base.append(_get_skill_definition([s.brief() for s in visible_skills]))
+            if recipes is not None:
+                base.append(_get_site_recipes_definition())
+                if recipes.can_write(policy):
+                    base.append(_save_site_recipe_definition())
+            if agent_on:
+                base.append(_delegate_definition())
             if planner is not None:
                 base.append(_plan_definition())
         if not policy.admin:
@@ -659,12 +1006,24 @@ def build_gateway_server(
         if not policy.allows_server(server_id) or not policy.tool_visible(server_id, orig):
             return _err_tool("Access denied for this tool.")
         cfg = registry.servers[server_id]
+        # Stateful servers (e.g. Playwright's open page) reuse one upstream session per
+        # downstream MCP session; everything else gets a fresh session per call.
+        downstream = None
+        if cfg.stateful and session_pool is not None:
+            try:
+                downstream = server.request_context.session
+            except LookupError:
+                downstream = None
         try:
-            async with open_upstream_session(cfg) as us:
-                return await us.call_tool(orig, arguments)
+            if downstream is not None:
+                res = await session_pool.call_tool(downstream, cfg, orig, arguments)
+            else:
+                async with open_upstream_session(cfg) as us:
+                    res = await us.call_tool(orig, arguments)
         except Exception as e:
             logger.exception("call_tool upstream error")
             return _err_tool(f"Upstream error: {e}")
+        return _with_recipes(res, arguments)
 
     async def handle_run_tool(arguments: dict[str, Any] | None) -> types.CallToolResult:
         """Execution proxy: runs any tool discovered via find_tools."""
@@ -803,7 +1162,7 @@ def build_gateway_server(
 
     _META_TOOL_NAMES = {
         FIND_TOOLS_NAME, RUN_TOOL_NAME, RUN_TOOLS_NAME, DESCRIBE_TOOL_NAME, PLAN_TOOL_NAME,
-        BROWSE_TOOLS_NAME,
+        BROWSE_TOOLS_NAME, GET_SKILL_NAME, DELEGATE_NAME, GET_SITE_RECIPES_NAME, SAVE_SITE_RECIPE_NAME,
     }
 
     @server.call_tool(validate_input=False)
@@ -823,6 +1182,14 @@ def build_gateway_server(
             return await handle_plan(arguments)
         if name == BROWSE_TOOLS_NAME:
             return await handle_browse_tools(arguments)
+        if name == GET_SKILL_NAME:
+            return await handle_get_skill(arguments)
+        if name == DELEGATE_NAME:
+            return await handle_delegate(arguments)
+        if name == GET_SITE_RECIPES_NAME:
+            return await handle_get_site_recipes(arguments)
+        if name == SAVE_SITE_RECIPE_NAME:
+            return await handle_save_site_recipe(arguments)
         return await _dispatch_tool(name, arguments)
 
     @server.list_resources()
