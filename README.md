@@ -453,6 +453,16 @@ when the client session ends, beyond `STICKY_MAX_SESSIONS` (20, LRU), on upstrea
 single-user homelab. Clients that open a new MCP session per call (e.g. one-shot curl) get
 no stickiness.
 
+### Long calls: background jobs
+
+MCP clients give up on a tool call after a fixed time (LibreChat: `timeout`, default
+30 s), while `research_route` takes up to ~75 s and `delegate` minutes. Every tool call
+therefore answers within `TOOL_CALL_SYNC_SECS` (default 25): with the result if done,
+otherwise with `{"status": "running", "job_id": …}` while the call keeps running in the
+background (`gateway/jobs.py`). The `get_job_result` meta-tool waits up to ~20 s and
+returns the original result, or `running` again. Jobs belong to the API key that started
+them, are kept 30 min after completion (dropped when fetched) and are lost on restart.
+
 ### Compact flight-search results
 
 Fare engines return huge payloads (a round-trip search: Kiwi ~54 KB, Google Flights
@@ -634,6 +644,7 @@ export them in your shell instead. All variables are optional — defaults below
 | `TOOL_RAG_DB`                  | `tool_registry.db`       | SQLite path; the FAISS index is stored next to it. Pinned to `/app/data/tool_registry.db` (the `tool-rag-data` volume) under compose |
 | `TOOL_RAG_AGENT`               | `off`                    | `on` = list the `delegate` sub-agent meta-tool (needs `TOOL_RAG_PLANNER=llm` with a tool-calling model) |
 | `TOOL_RAG_AGENT_TIMEOUT`       | `240`                    | Seconds budget for one `delegate` run |
+| `TOOL_CALL_SYNC_SECS`          | `25`                     | Tool calls slower than this return a `job_id`; fetch with `get_job_result` |
 | `COMPACT_MAX_OPTIONS`          | `10`                     | Options kept per compacted flight-search result (`compact_results` servers) |
 | `STICKY_SESSION_IDLE_SECS`     | `600`                    | Close a sticky upstream session (stateful servers) after this idle time |
 | `STICKY_MAX_SESSIONS`          | `20`                     | Max open sticky upstream sessions (least recently used closed first) |

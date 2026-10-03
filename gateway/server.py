@@ -19,6 +19,7 @@ from pydantic import AnyUrl
 
 from gateway.backends import open_upstream_session
 from gateway.compactors import compact
+from gateway.jobs import JobStore
 from gateway.context import get_policy
 from gateway.merge import (
     gateway_resource_uri,
@@ -82,6 +83,9 @@ DELEGATE_NAME = "delegate"
 # Site recipes: procedural memory for browser automation (gateway/recipes.py).
 GET_SITE_RECIPES_NAME = "get_site_recipes"
 SAVE_SITE_RECIPE_NAME = "save_site_recipe"
+
+# Long calls (past TOOL_CALL_SYNC_SECS) continue in the background; fetch with this.
+GET_JOB_RESULT_NAME = "get_job_result"
 
 # Default cap on concurrent upstream calls in run_tools (overridable per call and
 # via TOOL_RAG_MAX_PARALLEL). Bounds stdio subprocess spawns / upstream load.
@@ -179,6 +183,11 @@ def _gateway_instructions(planner_on: bool, catalog_on: bool = False, skills_on:
             f"call `{GET_SKILL_NAME}` and follow it — it says which tools to use and what to "
             f"try when the first attempt finds nothing. Don't give up after one empty search."
         )
+    base += (
+        f" Long calls (research, delegate) may return {{\"status\": \"running\", \"job_id\": ...}} "
+        f"instead of a result: they keep running — call `{GET_JOB_RESULT_NAME}` with the job_id "
+        f"(repeat while it says running) instead of retrying the call."
+    )
     if recipes_on:
         base += (
             f" Before automating a website with a browser, call `{GET_SITE_RECIPES_NAME}` for it "
@@ -472,6 +481,22 @@ def _delegate_definition() -> types.Tool:
     )
 
 
+def _get_job_result_definition() -> types.Tool:
+    return types.Tool(
+        name=GET_JOB_RESULT_NAME,
+        description=(
+            "Get the result of a long tool call that returned {\"status\": \"running\", \"job_id\": ...}. "
+            "Waits up to ~20 s; returns the original tool result when done, or status running again "
+            "(then call again). Don't re-run the original call — it is still working."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {"job_id": {"type": "string"}},
+            "required": ["job_id"],
+        },
+    )
+
+
 def _get_site_recipes_definition() -> types.Tool:
     return types.Tool(
         name=GET_SITE_RECIPES_NAME,
@@ -529,6 +554,7 @@ def build_gateway_server(
     session_pool: "StickySessionPool | None" = None,
 ) -> Server:
     agent_on = planner is not None and retriever is not None and agent_enabled()
+    jobs = JobStore()
     # Advertise discovery instructions only when Tool-RAG is wired up.
     server = Server(
         "homelab-mcp-gateway",
@@ -955,6 +981,7 @@ def build_gateway_server(
             visible_skills = skills.visible(policy) if skills else []
             if visible_skills:
                 base.append(_get_skill_definition([s.brief() for s in visible_skills]))
+            base.append(_get_job_result_definition())
             if recipes is not None:
                 base.append(_get_site_recipes_definition())
                 if recipes.can_write(policy):
@@ -1181,6 +1208,7 @@ def build_gateway_server(
     _META_TOOL_NAMES = {
         FIND_TOOLS_NAME, RUN_TOOL_NAME, RUN_TOOLS_NAME, DESCRIBE_TOOL_NAME, PLAN_TOOL_NAME,
         BROWSE_TOOLS_NAME, GET_SKILL_NAME, DELEGATE_NAME, GET_SITE_RECIPES_NAME, SAVE_SITE_RECIPE_NAME,
+        GET_JOB_RESULT_NAME,
     }
 
     @server.call_tool(validate_input=False)
@@ -1188,6 +1216,15 @@ def build_gateway_server(
         # One line per call so logs show which meta-tool (or upstream tool) ran —
         # CallToolRequest alone is generic. Keeps find_tools/run_tools/plan visible.
         logger.info("call_tool: %s (%s)", name, "meta" if name in _META_TOOL_NAMES else "upstream")
+        if name == GET_JOB_RESULT_NAME:
+            job_id = (arguments or {}).get("job_id")
+            if not isinstance(job_id, str) or not job_id:
+                return _err_tool("get_job_result requires a string `job_id`.")
+            return await jobs.result(get_policy().key_id, job_id, 20.0)
+        # Anything slower than the sync budget continues as a background job.
+        return await jobs.run(get_policy().key_id, name, _route_call(name, arguments))
+
+    async def _route_call(name: str, arguments: dict[str, Any] | None) -> types.CallToolResult:
         if name == FIND_TOOLS_NAME:
             return await handle_find_tools(arguments)
         if name == RUN_TOOL_NAME:
