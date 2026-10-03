@@ -4,7 +4,7 @@ WORKDIR /app
 
 RUN pip install --no-cache-dir \
     'httpx>=0.28.1' \
-    'mcp[cli]>=1.2.1' \
+    'mcp[cli]>=1.2.1,<2' \
     'pillow>=11.1.0'
 
 COPY mcp_image.py ./
