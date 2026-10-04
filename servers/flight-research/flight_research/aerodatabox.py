@@ -17,7 +17,7 @@ import httpx
 from flight_research import cache
 
 HOST = os.environ.get("AERODATABOX_HOST", "aerodatabox.p.rapidapi.com")
-ROUTES_TTL = 7 * 24 * 3600
+ROUTES_TTL = 30 * 24 * 3600  # route networks change slowly; quota is precious
 SCHEDULE_TTL = 6 * 3600
 # RapidAPI plans are rate-limited (free tier ~1 request/s): space calls out and
 # retry 429s instead of firing research_route's lookups all at once.
@@ -35,6 +35,9 @@ class AeroDataBox:
         self.calls = 0  # real (uncached) API calls since start
         self._lock = asyncio.Lock()
         self._last = 0.0
+        # Monthly API-unit quota exhausted (RapidAPI 429 "MONTHLY quota"): don't call
+        # again before the reset — callers fall back to engine-inferred hubs.
+        self._exhausted_until = 0.0
 
     @property
     def enabled(self) -> bool:
@@ -43,6 +46,9 @@ class AeroDataBox:
     async def _get(self, path: str, params: dict | None = None) -> dict:
         if not self.enabled:
             raise AeroDataBoxError("AERODATABOX_KEY is not configured")
+        if time.monotonic() < self._exhausted_until:
+            days = (self._exhausted_until - time.monotonic()) / 86400
+            raise AeroDataBoxError(f"monthly API quota exhausted; resets in {days:.1f} days")
         async with self._lock:  # one request at a time, MIN_INTERVAL_S apart
             for attempt in range(RETRIES_429 + 1):
                 wait = self._last + MIN_INTERVAL_S - time.monotonic()
@@ -53,6 +59,13 @@ class AeroDataBox:
                     r = await c.get(f"https://{HOST}{path}", params=params,
                                     headers={"X-RapidAPI-Key": self.key, "X-RapidAPI-Host": HOST})
                 self._last = time.monotonic()
+                if r.status_code == 429 and "quota" in r.text.lower():
+                    try:
+                        reset = float(r.headers.get("x-ratelimit-api-units-reset") or 86400)
+                    except ValueError:
+                        reset = 86400.0
+                    self._exhausted_until = time.monotonic() + reset
+                    break
                 if r.status_code != 429 or attempt == RETRIES_429:
                     break
                 try:
