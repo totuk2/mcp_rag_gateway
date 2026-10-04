@@ -15,6 +15,15 @@ import unicodedata
 from dataclasses import dataclass
 
 CSV_PATH = os.environ.get("AIRPORTS_CSV", "/app/data/airports.csv")
+COUNTRIES_CSV = os.environ.get("COUNTRIES_CSV", "/app/data/countries.csv")
+# Common non-English country names users type (OurAirports has English + local keywords).
+_COUNTRY_ALIASES = {
+    "polska": "PL", "syria": "SY", "jordania": "JO", "liban": "LB", "turcja": "TR", "niemcy": "DE",
+    "wlochy": "IT", "hiszpania": "ES", "francja": "FR", "grecja": "GR", "egipt": "EG", "irak": "IQ",
+    "iran": "IR", "rumunia": "RO", "wegry": "HU", "czechy": "CZ", "wielka brytania": "GB", "anglia": "GB",
+    "zjednoczone emiraty arabskie": "AE", "emiraty": "AE", "arabia saudyjska": "SA", "cypr": "CY",
+    "gruzja": "GE", "armenia": "AM", "azerbejdzan": "AZ", "izrael": "IL", "katar": "QA", "kuwejt": "KW",
+}
 # Lower is bigger. Small airports matter only when they have scheduled service.
 TYPE_RANK = {"large_airport": 0, "medium_airport": 1, "small_airport": 2}
 
@@ -40,6 +49,8 @@ _all: list[Airport] = []
 _by_name: dict[str, Airport] = {}
 # Normalized alternate names / metro codes (OurAirports `keywords`, e.g. "MIL" for MXP).
 _keywords: dict[str, set[str]] = {}
+# Normalized country name / keyword / alias -> ISO code.
+_countries: dict[str, str] = {}
 
 
 # Letters NFKD doesn't decompose into base + accent (else "Wałęsa" -> "waesa").
@@ -74,6 +85,14 @@ def load(path: str = CSV_PATH) -> None:
     _all.extend(_by_iata.values())
     for ap in _all:
         _by_name.setdefault(_norm(ap.name), ap)
+    if os.path.exists(COUNTRIES_CSV):
+        with open(COUNTRIES_CSV, encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                code = row.get("code") or ""
+                for n in [row.get("name") or ""] + (row.get("keywords") or "").split(","):
+                    if _norm(n):
+                        _countries.setdefault(_norm(n), code)
+    _countries.update(_COUNTRY_ALIASES)
 
 
 def _rank(ap: Airport) -> tuple:
@@ -106,6 +125,32 @@ _GENERIC = {"airport", "international", "intl", "aeroport", "aeropuerto", "aerop
 
 def _tokens(s: str) -> set[str]:
     return {t for t in _norm(s).split() if t not in _GENERIC}
+
+
+# Main international airport per country (OurAirports has no traffic data, and e.g.
+# every Polish airport is "large"): listed first, it's the one single-airport engines use.
+_PRIMARY = {
+    "PL": "WAW", "DE": "FRA", "GB": "LHR", "FR": "CDG", "IT": "FCO", "ES": "MAD", "TR": "IST",
+    "JO": "AMM", "LB": "BEY", "SY": "DAM", "IQ": "BGW", "EG": "CAI", "RO": "OTP", "HU": "BUD",
+    "CZ": "PRG", "GR": "ATH", "AE": "DXB", "SA": "RUH", "IL": "TLV", "UA": "KBP", "NL": "AMS",
+    "AT": "VIE", "CH": "ZRH", "SE": "ARN", "NO": "OSL", "DK": "CPH", "FI": "HEL", "PT": "LIS",
+    "IE": "DUB", "BE": "BRU", "US": "JFK", "IR": "IKA", "QA": "DOH", "KW": "KWI", "CY": "LCA",
+    "GE": "TBS", "AM": "EVN", "AZ": "GYD", "SK": "BTS", "BG": "SOF", "RS": "BEG", "HR": "ZAG",
+    "LT": "VNO", "LV": "RIX", "EE": "TLL",
+}
+
+
+def country_airports(location: str, limit: int = 12) -> list[Airport]:
+    """The main scheduled airports of a country given by name ("Poland", "Polska")
+    or ISO code ("PL"); [] if `location` isn't a country. Large airports first."""
+    load()
+    loc = (location or "").strip()
+    code = loc.upper() if re.fullmatch(r"[A-Za-z]{2}", loc) else _countries.get(_norm(loc))
+    if not code:
+        return []
+    aps = [a for a in _all if a.country == code and a.scheduled and a.type != "small_airport"]
+    primary = _PRIMARY.get(code)
+    return sorted(aps, key=lambda a: (a.iata != primary, *_rank(a)))[:limit]
 
 
 def code_for_name(name: str) -> str:

@@ -95,7 +95,8 @@ async def research_route(origin: str, destination: str, date: str, flex_days: in
     engine priced — check their websites). For a flexible window (e.g. "any day in
     December") pass `date` = first day and `date_to` = last day: the whole-trip search
     covers every day in the range in ONE call — prefer this over many calls with
-    different dates. `origin`/`destination`: IATA/metro code or
+    different dates. `origin`/`destination` may be a country ("Poland", "PL") = any of
+    its main airports; otherwise an IATA/metro code or
     city name in English or local spelling;
     `date`: YYYY-MM-DD."""
     try:

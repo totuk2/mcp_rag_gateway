@@ -119,15 +119,25 @@ async def research_route(origin: str, destination: str, day: str, flex_days: int
         if Date.fromisoformat(date_to) < Date.fromisoformat(day):
             return {"error": "date_to is before date"}
         flex_days = 0
-    o_hits, d_hits = airports.resolve(origin), airports.resolve(destination)
+    # A country ("Poland", "PL") means: any of its main airports, all equally fine.
+    o_country, d_country = airports.country_airports(origin), airports.country_airports(destination)
+    o_hits = o_country or airports.resolve(origin)
+    d_hits = d_country or airports.resolve(destination)
     if not o_hits or not d_hits:
-        return {"error": f"unknown {'origin' if not o_hits else 'destination'}: {origin if not o_hits else destination!r}"}
+        return {"error": f"unknown {'origin' if not o_hits else 'destination'}: "
+                         f"{origin if not o_hits else destination!r} (use an IATA code, city or country)"}
     O, D = o_hits[0], d_hits[0]
-    o_alts = [(a, km) for a, km in airports.nearby(O, origin_radius_km) if a.type != "small_airport"][:3]
-    d_alts = [(a, km) for a, km in airports.nearby(D, dest_radius_km)
-              if a.country == D.country or (frozenset((a.country, D.country)) not in CLOSED_BORDERS
-                                            and a.country not in NO_LAND_LINK and D.country not in NO_LAND_LINK)
-              ][:6] if allow_ground else []
+    if o_country:
+        o_alts = [(a, 0.0) for a in o_country[1:]]
+    else:
+        o_alts = [(a, km) for a, km in airports.nearby(O, origin_radius_km) if a.type != "small_airport"][:3]
+    if d_country:
+        d_alts = [(a, 0.0) for a in d_country[1:]]
+    else:
+        d_alts = [(a, km) for a, km in airports.nearby(D, dest_radius_km)
+                  if a.country == D.country or (frozenset((a.country, D.country)) not in CLOSED_BORDERS
+                                                and a.country not in NO_LAND_LINK and D.country not in NO_LAND_LINK)
+                  ][:6] if allow_ground else []
     O_set = [O.iata] + [a.iata for a, _ in o_alts]
     D_set = [D.iata] + [a.iata for a, _ in d_alts]
     ground_km = {D.iata: 0.0, **{a.iata: round(km) for a, km in d_alts}}
