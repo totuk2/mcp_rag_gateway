@@ -169,6 +169,11 @@ class StickySessionPool:
             del self._entries[(key, cfg.server_id)]
         entry.close()
 
+    def close_server(self, server_id: str) -> None:
+        """Close every sticky session to `server_id` (its config changed or it was removed)."""
+        for k in [k for k in self._entries if k[1] == server_id]:
+            self._entries.pop(k).close()
+
     @property
     def open_count(self) -> int:
         return sum(1 for e in self._entries.values() if e.alive)

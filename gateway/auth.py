@@ -60,6 +60,10 @@ class KeyStore:
                 raise ValueError(f"Key {key_id!r} needs secret or secret_hash")
         return cls(plaintext, hashed)
 
+    def replace(self, other: "KeyStore") -> None:
+        """Swap in another store's keys (hot reload); requests resolve per call."""
+        self._plaintext, self._hashed = other._plaintext, other._hashed
+
     def resolve(self, token: str) -> AccessPolicy | None:
         hit = self._plaintext.get(token)
         if hit:
