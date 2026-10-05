@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import time
 import weakref
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
@@ -20,6 +21,7 @@ from pydantic import AnyUrl
 from gateway.backends import open_upstream_session
 from gateway.compactors import compact
 from gateway.jobs import JobStore
+from gateway.metrics import Metrics
 from gateway.results import RESULT_MAX_CHARS, ProjectionError, ResultStore, view
 from gateway.context import get_policy
 from gateway.merge import (
@@ -587,7 +589,9 @@ def build_gateway_server(
     skills: "SkillStore | None" = None,
     recipes: "RecipeStore | None" = None,
     session_pool: "StickySessionPool | None" = None,
+    metrics: Metrics | None = None,
 ) -> Server:
+    metrics = metrics if metrics is not None else Metrics()
     agent_on = planner is not None and retriever is not None and agent_enabled()
     jobs = JobStore()
     results = ResultStore()
@@ -1098,6 +1102,7 @@ def build_gateway_server(
                 downstream = server.request_context.session
             except LookupError:
                 downstream = None
+        t0 = time.monotonic()
         try:
             if downstream is not None:
                 res = await session_pool.call_tool(downstream, cfg, orig, arguments)
@@ -1106,8 +1111,12 @@ def build_gateway_server(
                     res = await us.call_tool(orig, arguments)
         except Exception as e:
             logger.exception("call_tool upstream error")
+            metrics.record(name, "upstream", False, (time.monotonic() - t0) * 1000)
             return _err_tool(f"Upstream error: {e}")
+        raw = sum(len(c.text) for c in res.content if isinstance(c, types.TextContent))
         res = _shape_result(name, orig, cfg, arguments, res, full, fields)
+        sent = sum(len(c.text) for c in res.content if isinstance(c, types.TextContent))
+        metrics.record(name, "upstream", not res.isError, (time.monotonic() - t0) * 1000, raw_chars=raw, sent_chars=sent)
         return _with_recipes(res, arguments)
 
     def _shape_result(name: str, orig: str, cfg: Any, arguments: dict[str, Any] | None,
@@ -1332,7 +1341,17 @@ def build_gateway_server(
                 return _err_tool("get_job_result requires a string `job_id`.")
             return await jobs.result(get_policy().key_id, job_id, 20.0)
         # Anything slower than the sync budget continues as a background job.
-        return await jobs.run(get_policy().key_id, name, _route_call(name, arguments))
+        key_id = get_policy().key_id
+        return await jobs.run(key_id, name, _timed_call(name, arguments, key_id), metrics.job_started)
+
+    async def _timed_call(name: str, arguments: dict[str, Any] | None, key_id: str) -> types.CallToolResult:
+        t0, ok = time.monotonic(), False
+        try:
+            res = await _route_call(name, arguments)
+            ok = not res.isError
+            return res
+        finally:
+            metrics.record(name, "call", ok, (time.monotonic() - t0) * 1000, key_id)
 
     async def _route_call(name: str, arguments: dict[str, Any] | None) -> types.CallToolResult:
         if name == FIND_TOOLS_NAME:
@@ -1467,4 +1486,5 @@ def build_gateway_server(
         async with open_upstream_session(cfg) as us:
             return await us.get_prompt(orig, arguments)
 
+    server.gateway_metrics = metrics  # read by the /tool-rag/metrics/* endpoints
     return server

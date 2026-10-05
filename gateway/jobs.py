@@ -58,7 +58,7 @@ class JobStore:
                 j.task.cancel()
                 del self._jobs[jid]
 
-    async def run(self, key_id: str, tool: str, coro: Any) -> types.CallToolResult:
+    async def run(self, key_id: str, tool: str, coro: Any, on_background: Any = None) -> types.CallToolResult:
         """Run `coro`; return its result if it finishes within the sync budget,
         else a 'running' handle (the call continues in the background)."""
         task = asyncio.ensure_future(coro)
@@ -69,6 +69,8 @@ class JobStore:
         if sum(1 for j in self._jobs.values() if j.key_id == key_id and j.finished is None) >= MAX_JOBS_PER_KEY:
             task.cancel()
             return _text({"status": "error", "error": "too many running background jobs for this key"}, error=True)
+        if on_background is not None:
+            on_background(tool)
         job = Job(secrets.token_hex(8), key_id, tool, task)
         task.add_done_callback(lambda _t, j=job: setattr(j, "finished", time.monotonic()))
         self._jobs[job.job_id] = job

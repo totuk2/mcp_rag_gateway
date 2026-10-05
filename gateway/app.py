@@ -178,6 +178,15 @@ def build_starlette_app(registry, key_store, mcp_path=DEFAULT_MCP_PATH, tool_rag
         logger.info("Hot reload: synced %d servers (%d added, %d removed tools)",
                     result.servers_synced, result.tools_added, result.tools_removed)
 
+    gw_metrics = getattr(mcp, "gateway_metrics", None)
+
+    async def tool_metrics(request):
+        policy = current_policy.get()
+        return JSONResponse(gw_metrics.snapshot(include_keys=policy is None or policy.admin))
+
+    async def prometheus_metrics(request):
+        return Response(gw_metrics.prometheus(), media_type="text/plain; version=0.0.4")
+
     reloader = None
     if config_paths is not None:
         reg_path, gen_path, keys_path = config_paths
@@ -258,6 +267,8 @@ def build_starlette_app(registry, key_store, mcp_path=DEFAULT_MCP_PATH, tool_rag
             Route("/tool-rag/reindex", endpoint=tool_rag_router.reindex, methods=["POST"]),
             Route("/tool-rag/health", endpoint=tool_rag_router.health, methods=["GET"]),
             Route("/tool-rag/metrics", endpoint=tool_rag_router.metrics, methods=["GET"]),
+            Route("/tool-rag/metrics/tools", endpoint=tool_metrics, methods=["GET"]),
+            Route("/tool-rag/metrics/prometheus", endpoint=prometheus_metrics, methods=["GET"]),
             Route("/tool-rag/tool/{tool_id:path}", endpoint=tool_rag_router.describe, methods=["GET"]),
             Route("/tool-rag/catalog", endpoint=tool_rag_router.catalog, methods=["GET"]),
             Route("/tool-rag/catalog/refresh", endpoint=tool_rag_router.catalog_refresh, methods=["POST"]),
