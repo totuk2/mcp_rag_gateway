@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ipaddress
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Any, Literal
 
@@ -35,11 +37,28 @@ class ServerConfig:
     stateful: bool = False
     # Rewrite oversized flight-search results into a short digest (gateway/compactors.py).
     compact_results: bool = False
+    # Quarantine new tools / changed descriptions until an admin approves them
+    # (tool poisoning / "rug pull" defence). Default: on for servers outside the LAN.
+    review_changes: bool = False
 
 
 @dataclass(frozen=True)
 class Registry:
     servers: dict[str, ServerConfig]
+
+
+def _is_external(url: str | None) -> bool:
+    """A URL outside the homelab: not a compose service name, LAN name or private IP."""
+    host = (urlsplit(url).hostname or "") if url else ""
+    if not host or "." not in host:
+        return False
+    if host.endswith((".lan", ".local", ".home", ".internal", ".localdomain")):
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+        return not (ip.is_private or ip.is_loopback)
+    except ValueError:
+        return True
 
 
 def _catalog_meta(raw: dict[str, Any]) -> dict[str, Any]:
@@ -50,6 +69,8 @@ def _catalog_meta(raw: dict[str, Any]) -> dict[str, Any]:
         "categories": tuple(str(c) for c in cats),
         "stateful": bool(raw.get("stateful", False)),
         "compact_results": bool(raw.get("compact_results", False)),
+        "review_changes": (bool(raw["review_changes"]) if raw.get("review_changes") is not None
+                           else _is_external(raw.get("url"))),
     }
 
 

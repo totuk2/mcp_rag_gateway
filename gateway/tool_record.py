@@ -9,7 +9,7 @@ from typing import Any, Literal
 
 
 ToolType = Literal["read", "write", "admin", "action", "query"]
-ToolStatus = Literal["active", "disabled", "deprecated"]
+ToolStatus = Literal["active", "disabled", "deprecated", "quarantined"]
 
 
 @dataclass(frozen=True)
@@ -39,6 +39,14 @@ class ToolRecord:
     @classmethod
     def compose_tool_id(cls, server_id: str, tool_name: str) -> str:
         return f"{server_id}__{tool_name}"
+
+    @property
+    def review_fingerprint(self) -> str:
+        """Hash of everything a model sees about the tool (name, description, input
+        schema): a change on a review_changes server needs admin approval."""
+        import json
+        blob = json.dumps([self.tool_name, self.description, self.input_schema], sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
     @property
     def content_fingerprint(self) -> str:

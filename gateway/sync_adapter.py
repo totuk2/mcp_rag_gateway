@@ -27,6 +27,7 @@ class SyncResult:
     tools_added: int = 0
     tools_updated: int = 0
     tools_removed: int = 0
+    reviews_pending: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -61,6 +62,10 @@ class SyncAdapter:
         for server_id, cfg in self._registry.servers.items():
             try:
                 seen_ids: set[str] = set()
+                # Trust on first use: a server's first sync is accepted as-is; afterwards
+                # (review_changes servers) new tools and changed descriptions/schemas wait
+                # for admin approval while the approved version stays in use.
+                known = bool(self._tool_db.list_tools(server_id=server_id)) if cfg.review_changes else False
                 async with open_upstream_session(cfg, on_init=self._upstream_info_recorder(server_id)) as session:
                     tr = await session.list_tools()
                     for tool in tr.tools:
@@ -73,6 +78,8 @@ class SyncAdapter:
                         ):
                             record = replace(record, tags=cached["tags"])
                         existing = self._tool_db.get_tool(record.tool_id)
+                        if known:
+                            record = self._review(server_id, record, existing, result)
                         self._tool_db.upsert_tool(record)
                         seen_ids.add(record.tool_id)
                         if existing:
@@ -88,6 +95,7 @@ class SyncAdapter:
                 removed = all_server_tools - seen_ids
                 for tid in removed:
                     self._tool_db.delete_tool(tid)
+                    self._tool_db.delete_review(tid)
                     result.tools_removed += 1
                 result.servers_synced += 1
                 logger.info(
@@ -112,6 +120,27 @@ class SyncAdapter:
                 result.tools_removed += 1
                 logger.info("Pruned tool %s (server %s not in registry)", rec.tool_id, rec.server_id)
         return result
+
+    def _review(self, server_id: str, record: ToolRecord, existing: ToolRecord | None,
+                result: SyncResult) -> ToolRecord:
+        """Quarantine logic for review_changes servers (after their first sync)."""
+        pending = {"tool_name": record.tool_name, "description": record.description,
+                   "input_schema": record.input_schema}
+        if existing is None or existing.status == "quarantined":
+            if self._tool_db.put_review(record.tool_id, server_id, "new", record.review_fingerprint, pending):
+                logger.warning("Tool review: NEW tool %s quarantined until approved", record.tool_id)
+                result.reviews_pending += 1
+            return replace(record, status="quarantined")
+        if existing.review_fingerprint != record.review_fingerprint:
+            if self._tool_db.put_review(record.tool_id, server_id, "changed", record.review_fingerprint, pending):
+                logger.warning("Tool review: %s changed upstream; keeping the approved version until approved",
+                               record.tool_id)
+                result.reviews_pending += 1
+            # The model keeps seeing the approved name/description/schema.
+            return replace(record, description=existing.description, input_schema=existing.input_schema,
+                           tags=existing.tags)
+        self._tool_db.delete_review(record.tool_id)  # upstream reverted to the approved version
+        return record
 
     def _upstream_info_recorder(self, server_id: str):
         """on_init callback: keep the upstream's self-description (serverInfo

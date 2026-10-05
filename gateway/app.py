@@ -262,6 +262,8 @@ def build_starlette_app(registry, key_store, mcp_path=DEFAULT_MCP_PATH, tool_rag
             Route("/tool-rag/catalog", endpoint=tool_rag_router.catalog, methods=["GET"]),
             Route("/tool-rag/catalog/refresh", endpoint=tool_rag_router.catalog_refresh, methods=["POST"]),
             Route("/tool-rag/reload", endpoint=reload_endpoint, methods=["POST"]),
+            Route("/tool-rag/reviews", endpoint=tool_rag_router.reviews, methods=["GET"]),
+            Route("/tool-rag/reviews/{action}", endpoint=tool_rag_router.reviews_decide, methods=["POST"]),
         ])
     return Starlette(routes=routes, lifespan=lifespan, middleware=[Middleware(APIKeyMiddleware, key_store=key_store, skip_prefixes=_skip_prefixes(), anon_policy=anon_policy, anon_key_id=anon_key_id)])
 

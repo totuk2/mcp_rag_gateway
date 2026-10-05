@@ -97,6 +97,21 @@ class ToolDb:
             )
         """
         )
+        # Pending reviews of new tools / changed descriptions on review_changes servers.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tool_reviews (
+                tool_id TEXT PRIMARY KEY,
+                server_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'pending',
+                review_fp TEXT NOT NULL,
+                pending TEXT NOT NULL,
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL
+            )
+        """
+        )
         # Site recipes (gateway/recipes.py): how to query a website that agents
         # learned by browser automation. Shared across keys; NOT derived data.
         conn.execute(
@@ -430,6 +445,62 @@ class ToolDb:
                 "UPDATE catalog_taxonomy SET catalog_fingerprint = ?, categories = ? WHERE version = ?",
                 (catalog_fingerprint, self._serialize(categories), version),
             )
+            conn.commit()
+
+    # ------------------------------------------------------------------
+    # Tool reviews (quarantine)
+    # ------------------------------------------------------------------
+
+    def get_review(self, tool_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connect().execute("SELECT * FROM tool_reviews WHERE tool_id = ?", (tool_id,)).fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        d["pending"] = json.loads(d["pending"])
+        return d
+
+    def put_review(self, tool_id: str, server_id: str, kind: str, review_fp: str, pending: dict) -> bool:
+        """Record a pending review; returns True if it's new (or a different change
+        than the one already recorded / rejected)."""
+        now = self._now()
+        prev = self.get_review(tool_id)
+        if prev is not None and prev["review_fp"] == review_fp:
+            with self._lock:
+                self._connect().execute("UPDATE tool_reviews SET last_seen = ? WHERE tool_id = ?", (now, tool_id))
+                self._connect().commit()
+            return False
+        with self._lock:
+            conn = self._connect()
+            conn.execute(
+                "INSERT OR REPLACE INTO tool_reviews VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)",
+                (tool_id, server_id, kind, review_fp, self._serialize(pending), now, now),
+            )
+            conn.commit()
+        return True
+
+    def list_reviews(self, state: str | None = "pending") -> list[dict[str, Any]]:
+        q, p = ("SELECT * FROM tool_reviews WHERE state = ? ORDER BY server_id, tool_id", (state,)) if state \
+            else ("SELECT * FROM tool_reviews ORDER BY server_id, tool_id", ())
+        with self._lock:
+            rows = self._connect().execute(q, p).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["pending"] = json.loads(d["pending"])
+            out.append(d)
+        return out
+
+    def set_review_state(self, tool_id: str, state: str) -> None:
+        with self._lock:
+            conn = self._connect()
+            conn.execute("UPDATE tool_reviews SET state = ? WHERE tool_id = ?", (state, tool_id))
+            conn.commit()
+
+    def delete_review(self, tool_id: str) -> None:
+        with self._lock:
+            conn = self._connect()
+            conn.execute("DELETE FROM tool_reviews WHERE tool_id = ?", (tool_id,))
             conn.commit()
 
     # ------------------------------------------------------------------

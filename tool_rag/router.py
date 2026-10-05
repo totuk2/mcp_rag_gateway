@@ -230,6 +230,60 @@ class ToolRagRouter:
         return JSONResponse({**res.__dict__, "reindexed": reindexed})
 
     # ------------------------------------------------------------------
+    # Tool reviews (quarantine on review_changes servers) — admin only
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _admin() -> bool:
+        policy = current_policy.get()
+        return policy is not None and policy.admin
+
+    async def reviews(self, request: Request) -> JSONResponse:
+        if not self._admin():
+            return JSONResponse({"detail": "admin key required"}, status_code=403)
+        state = request.query_params.get("state", "pending")
+        out = []
+        for r in self._tool_db.list_reviews(None if state == "all" else state):
+            cur = self._tool_db.get_tool(r["tool_id"])
+            out.append({
+                "tool_id": r["tool_id"], "server_id": r["server_id"], "kind": r["kind"], "state": r["state"],
+                "first_seen": r["first_seen"], "last_seen": r["last_seen"],
+                "approved": None if cur is None or r["kind"] == "new" else
+                            {"description": cur.description, "input_schema": cur.input_schema},
+                "proposed": r["pending"],
+            })
+        return JSONResponse({"count": len(out), "reviews": out})
+
+    async def reviews_decide(self, request: Request) -> JSONResponse:
+        """POST /tool-rag/reviews/approve|reject  {"tool_ids": [...]} or {"all": true}."""
+        if not self._admin():
+            return JSONResponse({"detail": "admin key required"}, status_code=403)
+        action = request.path_params["action"]
+        body = await request.json() if (await request.body()) else {}
+        pending = {r["tool_id"]: r for r in self._tool_db.list_reviews("pending")}
+        ids = list(pending) if body.get("all") else [t for t in body.get("tool_ids") or [] if t in pending]
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%fZ")
+        done = []
+        for tid in ids:
+            if action == "approve":
+                rec = self._tool_db.get_tool(tid)
+                p = pending[tid]["pending"]
+                if rec is not None:
+                    from dataclasses import replace
+                    self._tool_db.upsert_tool(replace(
+                        rec, description=p.get("description", rec.description),
+                        input_schema=p.get("input_schema", rec.input_schema),
+                        status="active", last_seen_at=now))
+                self._tool_db.delete_review(tid)
+            elif action == "reject":
+                self._tool_db.set_review_state(tid, "rejected")
+            else:
+                return JSONResponse({"detail": "action must be approve or reject"}, status_code=400)
+            done.append(tid)
+        reindexed = self._indexer.incremental_reindex() if done and action == "approve" else 0
+        return JSONResponse({"action": action, "tool_ids": done, "reindexed": reindexed})
+
+    # ------------------------------------------------------------------
     # GET /tool-rag/health
     # ------------------------------------------------------------------
 
@@ -251,5 +305,6 @@ class ToolRagRouter:
             "tools_in_db": self._tool_db.count_tools(),
             "active_servers": self._tool_db.count_servers(),
             "stale_entries": self._tool_db.get_stale_count(),
+            "pending_reviews": len(self._tool_db.list_reviews("pending")),
             "started_at": self._started_at,
         })

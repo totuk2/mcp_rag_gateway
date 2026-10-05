@@ -1084,6 +1084,11 @@ def build_gateway_server(
             return _err_tool(f"Unknown server {server_id!r}.")
         if not policy.allows_server(server_id) or not policy.tool_visible(server_id, orig):
             return _err_tool("Access denied for this tool.")
+        if retriever is not None:
+            rec = retriever.get_tool(name)
+            if rec is not None and rec.status == "quarantined":
+                return _err_tool("This tool is new on an external server and pending admin review; it can't be "
+                                 "used until approved (GET /tool-rag/reviews).")
         cfg = registry.servers[server_id]
         # Stateful servers (e.g. Playwright's open page) reuse one upstream session per
         # downstream MCP session; everything else gets a fresh session per call.

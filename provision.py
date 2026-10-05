@@ -97,12 +97,11 @@ def catalog_fields(m: dict[str, Any], src: Path) -> dict[str, Any]:
         if not isinstance(cats, list) or not all(isinstance(c, str) and CATEGORY_NAME.match(c) for c in cats):
             raise ManifestError(f"{src}: `categories` must be a list of kebab-case names (e.g. web-browsing)")
         out["categories"] = list(dict.fromkeys(cats))
-    for flag in ("stateful", "compact_results"):
+    for flag in ("stateful", "compact_results", "review_changes"):
         if m.get(flag) is not None:
             if not isinstance(m[flag], bool):
                 raise ManifestError(f"{src}: `{flag}` must be true or false")
-            if m[flag]:
-                out[flag] = True
+            out[flag] = m[flag]  # explicit false matters for review_changes (external default)
     return out
 
 
