@@ -20,6 +20,7 @@ from pydantic import AnyUrl
 from gateway.backends import open_upstream_session
 from gateway.compactors import compact
 from gateway.jobs import JobStore
+from gateway.results import RESULT_MAX_CHARS, ProjectionError, ResultStore, view
 from gateway.context import get_policy
 from gateway.merge import (
     gateway_resource_uri,
@@ -86,6 +87,15 @@ SAVE_SITE_RECIPE_NAME = "save_site_recipe"
 
 # Long calls (past TOOL_CALL_SYNC_SECS) continue in the background; fetch with this.
 GET_JOB_RESULT_NAME = "get_job_result"
+
+# Read back a stored full result (compacted / oversized / projected calls) by result_id.
+GET_RESULT_NAME = "get_result"
+
+_FIELDS_SCHEMA = {
+    "type": "array", "items": {"type": "string"},
+    "description": ("Return only these fields of a JSON result (paths like \"query\", \"a.b\", "
+                    "\"items[].price\", \"items[0].title\"). Saves context on big results."),
+}
 
 # Default cap on concurrent upstream calls in run_tools (overridable per call and
 # via TOOL_RAG_MAX_PARALLEL). Bounds stdio subprocess spawns / upstream load.
@@ -309,6 +319,7 @@ def _run_tool_definition() -> types.Tool:
                     "type": "boolean",
                     "description": "Return the raw result even if the gateway would compact it (large flight searches).",
                 },
+                "fields": _FIELDS_SCHEMA,
             },
             "required": ["call_name"],
         },
@@ -350,6 +361,7 @@ def _run_tools_definition() -> types.Tool:
                                 "type": "boolean",
                                 "description": "Raw result instead of the gateway's compact digest.",
                             },
+                            "fields": _FIELDS_SCHEMA,
                         },
                         "required": ["call_name"],
                     },
@@ -481,6 +493,29 @@ def _delegate_definition() -> types.Tool:
     )
 
 
+def _get_result_definition() -> types.Tool:
+    return types.Tool(
+        name=GET_RESULT_NAME,
+        description=(
+            "Read a stored full tool result by `result_id` (given when the gateway shortened a "
+            "result: compact digest, oversized text, or a `fields` projection) without re-running "
+            "the call. Optional: `fields` (JSON paths to keep), `grep` (regex over lines), "
+            "`offset`/`limit` (character window, default 20000)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "result_id": {"type": "string"},
+                "fields": _FIELDS_SCHEMA,
+                "grep": {"type": "string", "description": "Case-insensitive regex; returns matching lines."},
+                "offset": {"type": "integer"},
+                "limit": {"type": "integer"},
+            },
+            "required": ["result_id"],
+        },
+    )
+
+
 def _get_job_result_definition() -> types.Tool:
     return types.Tool(
         name=GET_JOB_RESULT_NAME,
@@ -555,6 +590,7 @@ def build_gateway_server(
 ) -> Server:
     agent_on = planner is not None and retriever is not None and agent_enabled()
     jobs = JobStore()
+    results = ResultStore()
     # Advertise discovery instructions only when Tool-RAG is wired up.
     server = Server(
         "homelab-mcp-gateway",
@@ -766,7 +802,8 @@ def build_gateway_server(
             tool_args = args.get("arguments") or {}
             if not isinstance(tool_args, dict):
                 return "ERROR: `arguments` must be an object."
-            res = await _dispatch_tool(name, tool_args, full=args.get("full") is True)
+            res = await _dispatch_tool(name, tool_args, full=args.get("full") is True,
+                                       fields=args.get("fields") if isinstance(args.get("fields"), list) else None)
             text = "\n".join(c.text for c in res.content if isinstance(c, types.TextContent))
             if res.isError:
                 return f"ERROR: {text or 'tool returned an error'}"
@@ -784,7 +821,9 @@ def build_gateway_server(
             return f"ERROR: {text}" if res.isError else text
 
         obj = {"type": "object"}
-        extra: list[AgentTool] = []
+        extra: list[AgentTool] = [AgentTool(
+            "get_result", _get_result_definition().description or "", _get_result_definition().inputSchema,
+            lambda a: via(handle_get_result, a))]
         if recipes is not None:
             extra.append(AgentTool(
                 "get_site_recipes", "Saved recipes (URL template / steps) for querying a website; call before browsing a site.",
@@ -801,7 +840,8 @@ def build_gateway_server(
                       {**obj, "properties": {"call_name": {"type": "string"}}, "required": ["call_name"]}, describe),
             AgentTool("run_tool", "Execute a tool by call_name with arguments matching its input_schema.",
                       {**obj, "properties": {"call_name": {"type": "string"}, "arguments": {"type": "object"},
-                                         "full": {"type": "boolean", "description": "raw result instead of the compact digest"}},
+                                         "full": {"type": "boolean", "description": "raw result instead of the compact digest"},
+                                         "fields": _FIELDS_SCHEMA},
                        "required": ["call_name", "arguments"]}, run),
             AgentTool("get_skill", "Fetch a playbook by name.",
                       {**obj, "properties": {"name": {"type": "string"}}, "required": ["name"]}, skill),
@@ -982,6 +1022,7 @@ def build_gateway_server(
             if visible_skills:
                 base.append(_get_skill_definition([s.brief() for s in visible_skills]))
             base.append(_get_job_result_definition())
+            base.append(_get_result_definition())
             if recipes is not None:
                 base.append(_get_site_recipes_definition())
                 if recipes.can_write(policy):
@@ -1031,7 +1072,8 @@ def build_gateway_server(
             out.extend(part)
         return types.ListToolsResult(tools=out)
 
-    async def _dispatch_tool(name: str, arguments: dict[str, Any] | None, full: bool = False) -> types.CallToolResult:
+    async def _dispatch_tool(name: str, arguments: dict[str, Any] | None, full: bool = False,
+                             fields: list[str] | None = None) -> types.CallToolResult:
         """Inner dispatch: validate access and call an upstream tool by merged name."""
         policy = get_policy()
         try:
@@ -1060,13 +1102,74 @@ def build_gateway_server(
         except Exception as e:
             logger.exception("call_tool upstream error")
             return _err_tool(f"Upstream error: {e}")
-        if cfg.compact_results and not full and not res.isError:
-            text = "\n".join(c.text for c in res.content if isinstance(c, types.TextContent))
+        res = _shape_result(name, orig, cfg, arguments, res, full, fields)
+        return _with_recipes(res, arguments)
+
+    def _shape_result(name: str, orig: str, cfg: Any, arguments: dict[str, Any] | None,
+                      res: types.CallToolResult, full: bool, fields: list[str] | None) -> types.CallToolResult:
+        """Projection (`fields`), compact digests and oversize truncation. Whenever the
+        result is shortened, the full text is kept under a result_id (get_result)."""
+        if res.isError or not res.content or not all(isinstance(c, types.TextContent) for c in res.content):
+            return res
+        text = "\n".join(c.text for c in res.content)
+        key_id = get_policy().key_id
+
+        def out(body: str, note: str) -> types.CallToolResult:
+            return types.CallToolResult(content=[types.TextContent(type="text", text=body),
+                                                 types.TextContent(type="text", text=note)])
+
+        if fields:
+            try:
+                body, total = view(text, fields=fields, limit=RESULT_MAX_CHARS)
+            except ProjectionError as e:
+                return out(text if len(text) <= RESULT_MAX_CHARS else text[:RESULT_MAX_CHARS], f"[fields ignored: {e}]")
+            rid = results.put(key_id, name, text)
+            return out(body, f"[projected {len(text)} -> {total} chars; full result: get_result "
+                             f'{{"result_id": "{rid}"}}]')
+        if full:
+            return res
+        if cfg.compact_results:
             digest = compact(orig, arguments, text)
             if digest is not None:
-                logger.info("compacted %s result: %d -> %d chars", name, len(text), len(digest))
-                res = types.CallToolResult(content=[types.TextContent(type="text", text=digest)])
-        return _with_recipes(res, arguments)
+                rid = results.put(key_id, name, text)
+                logger.info("compacted %s result: %d -> %d chars (%s)", name, len(text), len(digest), rid)
+                try:
+                    d = json.loads(digest)
+                    d["result_id"] = rid
+                    d["note"] = (f"Compacted by the gateway: {d.get('shown')} of {d.get('total')} options. "
+                                 f"Details without re-running: get_result with result_id {rid} "
+                                 f"(fields / grep / offset).")
+                    return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(d, ensure_ascii=False))])
+                except (json.JSONDecodeError, AttributeError):
+                    return out(digest, f'[full result: get_result {{"result_id": "{rid}"}}]')
+        if len(text) > RESULT_MAX_CHARS:
+            rid = results.put(key_id, name, text)
+            logger.info("truncated %s result: %d -> %d chars (%s)", name, len(text), RESULT_MAX_CHARS, rid)
+            return out(text[:RESULT_MAX_CHARS],
+                       f"[truncated: showing {RESULT_MAX_CHARS} of {len(text)} chars. Rest: get_result "
+                       f'{{"result_id": "{rid}", "offset": {RESULT_MAX_CHARS}}} (or use fields / grep)]')
+        return res
+
+    async def handle_get_result(arguments: dict[str, Any] | None) -> types.CallToolResult:
+        a = arguments or {}
+        rid = a.get("result_id")
+        if not isinstance(rid, str) or not rid:
+            return _err_tool("get_result requires a string `result_id`.")
+        stored = results.get(get_policy().key_id, rid)
+        if stored is None:
+            return _err_tool(f"Unknown or expired result_id {rid!r} (results are kept 30 min, lost on restart).")
+        fields = a.get("fields") if isinstance(a.get("fields"), list) else None
+        try:
+            body, total = view(stored.text, fields=fields, grep=a.get("grep") or None,
+                               offset=int(a.get("offset") or 0), limit=int(a.get("limit") or 20000))
+        except (ProjectionError, ValueError, TypeError) as e:
+            return _err_tool(f"get_result: {e}")
+        end = int(a.get("offset") or 0) + len(body)
+        more = f" Next: offset {end}." if end < total else ""
+        return types.CallToolResult(content=[
+            types.TextContent(type="text", text=body),
+            types.TextContent(type="text", text=f"[{stored.tool} result {rid}: chars {int(a.get('offset') or 0)}-{end} of {total}.{more}]"),
+        ])
 
     async def handle_run_tool(arguments: dict[str, Any] | None) -> types.CallToolResult:
         """Execution proxy: runs any tool discovered via find_tools."""
@@ -1077,7 +1180,8 @@ def build_gateway_server(
         tool_arguments = args.get("arguments") or {}
         if not isinstance(tool_arguments, dict):
             return _err_tool("`arguments` must be a JSON object.")
-        return await _dispatch_tool(call_name, tool_arguments, full=args.get("full") is True)
+        fields = args.get("fields") if isinstance(args.get("fields"), list) else None
+        return await _dispatch_tool(call_name, tool_arguments, full=args.get("full") is True, fields=fields)
 
     def _result_to_json(res: types.CallToolResult) -> dict[str, Any]:
         """Flatten a CallToolResult into a JSON-able summary for run_tools. On
@@ -1124,7 +1228,8 @@ def build_gateway_server(
                 return {**tag, "ok": False, "error": "`arguments` must be a JSON object."}
             async with sem:
                 try:
-                    res = await _dispatch_tool(call["call_name"], tool_args, full=call.get("full") is True)
+                    res = await _dispatch_tool(call["call_name"], tool_args, full=call.get("full") is True,
+                                               fields=call.get("fields") if isinstance(call.get("fields"), list) else None)
                 except Exception as e:  # defensive; _dispatch_tool already catches upstream
                     return {**tag, "ok": False, "error": f"Execution error: {e}"}
             return {**tag, **_result_to_json(res)}
@@ -1208,7 +1313,7 @@ def build_gateway_server(
     _META_TOOL_NAMES = {
         FIND_TOOLS_NAME, RUN_TOOL_NAME, RUN_TOOLS_NAME, DESCRIBE_TOOL_NAME, PLAN_TOOL_NAME,
         BROWSE_TOOLS_NAME, GET_SKILL_NAME, DELEGATE_NAME, GET_SITE_RECIPES_NAME, SAVE_SITE_RECIPE_NAME,
-        GET_JOB_RESULT_NAME,
+        GET_JOB_RESULT_NAME, GET_RESULT_NAME,
     }
 
     @server.call_tool(validate_input=False)
@@ -1243,6 +1348,8 @@ def build_gateway_server(
             return await handle_delegate(arguments)
         if name == GET_SITE_RECIPES_NAME:
             return await handle_get_site_recipes(arguments)
+        if name == GET_RESULT_NAME:
+            return await handle_get_result(arguments)
         if name == SAVE_SITE_RECIPE_NAME:
             return await handle_save_site_recipe(arguments)
         return await _dispatch_tool(name, arguments)
