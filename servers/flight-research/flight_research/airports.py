@@ -3,6 +3,14 @@
 The CSV (https://ourairports.com/data/, public domain) is downloaded into the
 image at build time; AIRPORTS_CSV overrides the path. Only airports with an
 IATA code are kept — those are the ones fare engines can price.
+
+Everything else is derived from data, not hand-kept tables (each file optional):
+- COUNTRY_NAMES_CSV: country names in every CLDR language (build_data.py).
+- ROUTES_DAT: OpenFlights routes (ODbL); routes per airport = its traffic rank,
+  which picks a country's main airport (OurAirports has no traffic data).
+- AIRPORT_OVERRIDES: `kind,key,value` rows for what data gets wrong
+  (`country_alias,anglia,GB`, `primary,US,JFK`; borders.py reads `land_link`
+  and `closed_border`).
 """
 
 from __future__ import annotations
@@ -12,18 +20,17 @@ import math
 import os
 import re
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass
 
 CSV_PATH = os.environ.get("AIRPORTS_CSV", "/app/data/airports.csv")
 COUNTRIES_CSV = os.environ.get("COUNTRIES_CSV", "/app/data/countries.csv")
-# Common non-English country names users type (OurAirports has English + local keywords).
-_COUNTRY_ALIASES = {
-    "polska": "PL", "syria": "SY", "jordania": "JO", "liban": "LB", "turcja": "TR", "niemcy": "DE",
-    "wlochy": "IT", "hiszpania": "ES", "francja": "FR", "grecja": "GR", "egipt": "EG", "irak": "IQ",
-    "iran": "IR", "rumunia": "RO", "wegry": "HU", "czechy": "CZ", "wielka brytania": "GB", "anglia": "GB",
-    "zjednoczone emiraty arabskie": "AE", "emiraty": "AE", "arabia saudyjska": "SA", "cypr": "CY",
-    "gruzja": "GE", "armenia": "AM", "azerbejdzan": "AZ", "izrael": "IL", "katar": "QA", "kuwejt": "KW",
-}
+COUNTRY_NAMES_CSV = os.environ.get("COUNTRY_NAMES_CSV", "/app/data/country_names.csv")
+ROUTES_DAT = os.environ.get("ROUTES_DAT", "/app/data/routes.dat")
+OVERRIDES_CSV = os.environ.get("AIRPORT_OVERRIDES", os.path.join(os.path.dirname(__file__), "overrides.csv"))
+# A name word in more than this share of airport names ("airport", "regional",
+# "field") says nothing about which airport is meant.
+GENERIC_DF = float(os.environ.get("AIRPORT_GENERIC_DF", "0.005"))
 # Lower is bigger. Small airports matter only when they have scheduled service.
 TYPE_RANK = {"large_airport": 0, "medium_airport": 1, "small_airport": 2}
 
@@ -51,6 +58,12 @@ _by_name: dict[str, Airport] = {}
 _keywords: dict[str, set[str]] = {}
 # Normalized country name / keyword / alias -> ISO code.
 _countries: dict[str, str] = {}
+# IATA -> number of routes touching it (OpenFlights); 0 when unknown.
+_traffic: dict[str, int] = {}
+# Country ISO code -> pinned main airport (overrides only; else busiest wins).
+_primary: dict[str, str] = {}
+# Name words too common to identify an airport (computed in load()).
+_generic: set[str] = set()
 
 
 # Letters NFKD doesn't decompose into base + accent (else "Wałęsa" -> "waesa").
@@ -85,18 +98,37 @@ def load(path: str = CSV_PATH) -> None:
     _all.extend(_by_iata.values())
     for ap in _all:
         _by_name.setdefault(_norm(ap.name), ap)
-    if os.path.exists(COUNTRIES_CSV):
-        with open(COUNTRIES_CSV, encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                code = row.get("code") or ""
-                for n in [row.get("name") or ""] + (row.get("keywords") or "").split(","):
-                    if _norm(n):
-                        _countries.setdefault(_norm(n), code)
-    _countries.update(_COUNTRY_ALIASES)
+    df = Counter(t for ap in _all for t in set(_norm(ap.name).split()))
+    _generic.update(t for t, n in df.items() if n > len(_all) * GENERIC_DF)
+    # English names and OurAirports keywords first; CLDR translations only fill gaps.
+    for path, names in ((COUNTRIES_CSV, lambda r: [r.get("name") or ""] + (r.get("keywords") or "").split(",")),
+                        (COUNTRY_NAMES_CSV, lambda r: [r.get("name") or ""])):
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    for n in names(row):
+                        if _norm(n):
+                            _countries.setdefault(_norm(n), row.get("code") or "")
+    if os.path.exists(ROUTES_DAT):
+        with open(ROUTES_DAT, encoding="utf-8") as f:
+            routes = {(r[2], r[4]) for r in csv.reader(f) if len(r) > 4}
+        _traffic.update(Counter(code for route in routes for code in route))
+    for key, value in override_rows("country_alias"):
+        _countries[_norm(key)] = value.upper()
+    for key, value in override_rows("primary"):
+        _primary[key.upper()] = value.upper()
+
+
+def override_rows(kind: str) -> list[tuple[str, str]]:
+    """(key, value) rows of one `kind` from AIRPORT_OVERRIDES; [] without the file."""
+    if not os.path.exists(OVERRIDES_CSV):
+        return []
+    with open(OVERRIDES_CSV, encoding="utf-8") as f:
+        return [(row.get("key") or "", row.get("value") or "") for row in csv.DictReader(f) if row.get("kind") == kind]
 
 
 def _rank(ap: Airport) -> tuple:
-    return (not ap.scheduled, TYPE_RANK[ap.type], ap.iata)
+    return (not ap.scheduled, TYPE_RANK[ap.type], -_traffic.get(ap.iata, 0), ap.iata)
 
 
 def get(iata: str) -> Airport | None:
@@ -120,37 +152,28 @@ def resolve(location: str) -> list[Airport]:
     return sorted(partial, key=_rank)[:10]
 
 
-_GENERIC = {"airport", "international", "intl", "aeroport", "aeropuerto", "aeroporto", "flughafen", "the", "of"}
-
-
 def _tokens(s: str) -> set[str]:
-    return {t for t in _norm(s).split() if t not in _GENERIC}
+    return {t for t in _norm(s).split() if t not in _generic}
 
 
-# Main international airport per country (OurAirports has no traffic data, and e.g.
-# every Polish airport is "large"): listed first, it's the one single-airport engines use.
-_PRIMARY = {
-    "PL": "WAW", "DE": "FRA", "GB": "LHR", "FR": "CDG", "IT": "FCO", "ES": "MAD", "TR": "IST",
-    "JO": "AMM", "LB": "BEY", "SY": "DAM", "IQ": "BGW", "EG": "CAI", "RO": "OTP", "HU": "BUD",
-    "CZ": "PRG", "GR": "ATH", "AE": "DXB", "SA": "RUH", "IL": "TLV", "UA": "KBP", "NL": "AMS",
-    "AT": "VIE", "CH": "ZRH", "SE": "ARN", "NO": "OSL", "DK": "CPH", "FI": "HEL", "PT": "LIS",
-    "IE": "DUB", "BE": "BRU", "US": "JFK", "IR": "IKA", "QA": "DOH", "KW": "KWI", "CY": "LCA",
-    "GE": "TBS", "AM": "EVN", "AZ": "GYD", "SK": "BTS", "BG": "SOF", "RS": "BEG", "HR": "ZAG",
-    "LT": "VNO", "LV": "RIX", "EE": "TLL",
-}
+def country_code(location: str) -> str | None:
+    """ISO code for a country name in any language ("Polska", "Allemagne") or a
+    2-letter code ("PL"); None if `location` isn't a country."""
+    load()
+    loc = (location or "").strip()
+    return loc.upper() if re.fullmatch(r"[A-Za-z]{2}", loc) else _countries.get(_norm(loc))
 
 
 def country_airports(location: str, limit: int = 12) -> list[Airport]:
     """The main scheduled airports of a country given by name ("Poland", "Polska")
-    or ISO code ("PL"); [] if `location` isn't a country. Large airports first."""
-    load()
-    loc = (location or "").strip()
-    code = loc.upper() if re.fullmatch(r"[A-Za-z]{2}", loc) else _countries.get(_norm(loc))
+    or ISO code ("PL"); [] if `location` isn't a country. Busiest first — the
+    first one is what single-airport engines use."""
+    code = country_code(location)
     if not code:
         return []
     aps = [a for a in _all if a.country == code and a.scheduled and a.type != "small_airport"]
-    primary = _PRIMARY.get(code)
-    return sorted(aps, key=lambda a: (a.iata != primary, *_rank(a)))[:limit]
+    # Traffic before type: OurAirports calls e.g. every Polish airport "large".
+    return sorted(aps, key=lambda a: (a.iata != _primary.get(code), -_traffic.get(a.iata, 0), *_rank(a)))[:limit]
 
 
 def code_for_name(name: str) -> str:

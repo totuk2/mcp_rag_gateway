@@ -46,6 +46,23 @@ done.
    route actually operates — shift the date if the last leg doesn't fly that day.
 4. **Ground options.** A nearby airport plus a bus/taxi can beat the direct airport.
    Always state the distance and whether a border crossing is involved.
+   - `border_warnings` (and each option's `border_warnings`) are **remembered reports**
+     of closed/restricted borders, and island legs with no road link. Repeat them to the
+     user with their date and source; for island legs tell the user to double-check the
+     ferry/sea connection. Options behind them are ranked down, not removed.
+   - `unverified_borders` = land borders crossed by the shown options with no remembered
+     status. If your answer recommends a ground leg across one, web-search its current
+     status first.
+   - **Grow the border memory:** whenever a web search shows a land border closed,
+     restricted (only some crossings, permits, locals only) or open again, call
+     `flight-research__report_border_status` with both countries, the status, the source
+     URL and a one-line note. Report "open" too — it clears an old closure.
+     `flight-research__border_status` shows what is remembered.
+   - **When the user says a border is closed (or open), never take it as given:**
+     always verify it with a web search first. If the search confirms it, record it with
+     `flight-research__report_border_status` (the source URL is the page that confirms it,
+     not the user). If the search contradicts the user or finds nothing, tell the user
+     what you found and don't record it.
 
 5. **Airline codes.** Many airlines fly under several IATA codes; filter with all of
    them (`select_airlines`): Wizz Air `W6,W4,W9,5W` (W4 = Wizz Air Malta), Ryanair
@@ -89,4 +106,5 @@ airline's own booking page with the Playwright tools (`playwright__browser_navig
   Yemen), add a short note to check the official travel advisory and visa rules before
   booking.
 - Never state as fact whether a border crossing is open, a visa is available or a route
-  is safe — no tool here checks that. Say it must be verified (official sources).
+  is safe. Border memory entries are reports ("reported closed on <date>, <source>"), not
+  verified facts — say they must be verified with official sources.

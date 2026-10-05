@@ -22,7 +22,7 @@ import time
 from collections import defaultdict
 from datetime import date as Date, datetime, timedelta
 
-from flight_research import airports, engines, fx
+from flight_research import airports, borders, engines, fx
 from flight_research.aerodatabox import AeroDataBox
 
 BUDGET_S = float(os.environ.get("RESEARCH_BUDGET_S", "75"))
@@ -36,22 +36,17 @@ PER_HOUR = 8.0
 SELF_TRANSFER = 25.0
 PER_STOP = 10.0
 PER_100KM_GROUND = 35.0
-BORDER_CROSSING = 80.0  # ground leg into another country (visas, closures, time)
+BORDER_CROSSING = 80.0  # per land border on the ground leg (visas, queues, time)
+# Ground legs across a border the memory reports closed/restricted (borders.py):
+# kept, but ranked down. An island leg (no road link) is only flagged: it costs what
+# one ordinary border crossing does, nothing extra.
+CLOSED_BORDER = 300.0
+RESTRICTED_BORDER = 100.0
+NO_LAND_LINK = BORDER_CROSSING
 # Ranked list diversity: at most this many options per (arrival airport, last hub).
 PER_PATTERN = 2
-# Country pairs whose land border is closed: an airport across it is no alternative
-# for ground transfer. ISO-3166 alpha-2 pairs, order-insensitive; override with
-# CLOSED_LAND_BORDERS="IL-SY,IL-LB,..." (empty string disables).
-CLOSED_BORDERS = {
-    frozenset(p.split("-")) for p in os.environ.get(
-        "CLOSED_LAND_BORDERS", "IL-SY,IL-LB,AM-TR,AM-AZ,KP-KR,IL-IQ,IL-IR"
-    ).split(",") if "-" in p
-}
-# Island states with no road link to other countries: their airports are no ground
-# alternative for a destination abroad (and vice versa). NO_LAND_LINK_COUNTRIES overrides.
-NO_LAND_LINK = set(filter(None, os.environ.get(
-    "NO_LAND_LINK_COUNTRIES", "CY,MT,IS,MV,MU,SC,CV,LK,NZ,JP,TW,PH,ID,CU,JM,FJ"
-).split(",")))
+# Destination alternatives (ground transfer) kept for searching, cleanest first.
+MAX_DEST_ALTS = 6
 
 
 def _parse(t: str | None) -> datetime | None:
@@ -107,6 +102,16 @@ class _Runner:
         return []
 
 
+def _blocked(g: dict) -> bool:
+    return any(c["status"] in ("closed", "restricted") for c in g["crossings"])
+
+
+def _ground_penalty(g: dict) -> float:
+    st = [c["status"] for c in g["crossings"]]
+    return (BORDER_CROSSING * len(st) + CLOSED_BORDER * st.count("closed")
+            + RESTRICTED_BORDER * st.count("restricted") + NO_LAND_LINK * (not g["land_link"]))
+
+
 async def research_route(origin: str, destination: str, day: str, flex_days: int = 2, adults: int = 1,
                          max_price_eur: float | None = None, dest_radius_km: float = 400,
                          origin_radius_km: float = 200, allow_ground: bool = True,
@@ -131,13 +136,23 @@ async def research_route(origin: str, destination: str, day: str, flex_days: int
         o_alts = [(a, 0.0) for a in o_country[1:]]
     else:
         o_alts = [(a, km) for a, km in airports.nearby(O, origin_radius_km) if a.type != "small_airport"][:3]
+    memory = borders.known()
+    ground_route = {}  # country -> borders.route() to D.country
+
+    def ground(country: str) -> dict:
+        if country not in ground_route:
+            ground_route[country] = borders.route(country, D.country, memory)
+        return ground_route[country]
+
     if d_country:
         d_alts = [(a, 0.0) for a in d_country[1:]]
+    elif allow_ground:
+        # Nothing is dropped for its border: airports behind a reported closure go
+        # after the clean ones; island legs keep their place (flagged on the options).
+        near = airports.nearby(D, dest_radius_km)
+        d_alts = sorted(near, key=lambda x: (_blocked(ground(x[0].country)), x[1]))[:MAX_DEST_ALTS]
     else:
-        d_alts = [(a, km) for a, km in airports.nearby(D, dest_radius_km)
-                  if a.country == D.country or (frozenset((a.country, D.country)) not in CLOSED_BORDERS
-                                                and a.country not in NO_LAND_LINK and D.country not in NO_LAND_LINK)
-                  ][:6] if allow_ground else []
+        d_alts = []
     O_set = [O.iata] + [a.iata for a, _ in o_alts]
     D_set = [D.iata] + [a.iata for a, _ in d_alts]
     ground_km = {D.iata: 0.0, **{a.iata: round(km) for a, km in d_alts}}
@@ -257,20 +272,31 @@ async def research_route(origin: str, destination: str, day: str, flex_days: int
         hrs = _hours(segs)
         land = airports.get(final)
         border = bool(gkm) and land is not None and land.country != D.country
+        g = ground(land.country) if border else None
+        warn = borders.warnings(g) if g else []
         score = (price_eur + PER_HOUR * (hrs or 24) + SELF_TRANSFER * bool(it["self_transfer"])
                  + PER_STOP * (len(segs) - 1) + PER_100KM_GROUND * ((gkm or 0) / 100)
-                 + BORDER_CROSSING * border)
+                 + (_ground_penalty(g) if g else 0))
         extra = []
         if gkm:
+            via = "→".join(g["path"]) if g and g["land_link"] else ""
+            how = ("away, across the sea," if g and g.get("islands") else "away (no road route found)"
+                   if g and not g["land_link"] else "by ground")
             extra.append(f"lands in {final} ({land.city if land else '?'}, {land.country if land else '?'}), "
-                         f"~{gkm} km by ground to {D.iata}" + (f" incl. border crossing {land.country}→{D.country}" if border else ""))
+                         f"~{gkm} km {how} to {D.iata}" + (f" incl. border crossing {via}" if via else ""))
+        extra += warn
         options.append({
             "price_eur": price_eur, "price": it["price"], "currency": it["currency"], "source": it["source"],
             "route": "-".join([segs[0]["from"]] + [s["to"] for s in segs]),
             "arrives_at": final, "ground_km_to_destination": gkm, "self_transfer": it["self_transfer"],
             "total_hours_approx": hrs, "stops": len(segs) - 1, "segments": segs,
             "booking_urls": [u for u in it.get("booking_urls") or [it.get("booking_url")] if u],
-            "notes": extra + it["notes"], "border_crossing": border, "_score": round(score, 2),
+            "notes": extra + it["notes"], "border_crossing": border,
+            "border_crossings": [c["border"] for c in g["crossings"]] if g else [],
+            "land_link": g["land_link"] if g else True, "island_leg": bool(g and g.get("islands")),
+            "border_warnings": warn,
+            "_unverified": [c["border"] for c in g["crossings"] if c["status"] is None] if g else [],
+            "_score": round(score, 2),
         })
     options.sort(key=lambda o: (o["_score"], o["price_eur"], o["route"]))
     # Diversity: cap options per (arrival airport, last connection) so one cheap
@@ -282,9 +308,14 @@ async def research_route(origin: str, destination: str, day: str, flex_days: int
         per_pattern[pat] += 1
         (head if per_pattern[pat] <= PER_PATTERN else tail).append(o)
     options = head + tail
+    unverified: set[str] = set()
     for i, o in enumerate(options, 1):
         o["rank"] = i
         o.pop("_score")
+        if i <= 10:
+            unverified.update(o.pop("_unverified"))
+        else:
+            o.pop("_unverified")
 
     # 6. Last-leg airlines nobody priced -> check their own websites.
     priced = " ".join(str(s.get("carrier") or "") for o in options for s in o["segments"]).lower()
@@ -300,9 +331,12 @@ async def research_route(origin: str, destination: str, day: str, flex_days: int
     def line(o: dict) -> str:
         segs = o["segments"]
         dep, arr = (segs[0]["dep"] or "")[:16].replace("T", " "), (segs[-1]["arr"] or "")[:16].replace("T", " ")
-        flags = (["self-transfer"] if o["self_transfer"] else []) + (
-            [f"+{o['ground_km_to_destination']} km ground{' + border' if o['border_crossing'] else ''}"]
-            if o["ground_km_to_destination"] else [])
+        km = o["ground_km_to_destination"]
+        ground = (f"+{km} km across the sea, island: check ferry" if o["island_leg"]
+                  else f"+{km} km, NO road route found: verify" if not o["land_link"]
+                  else f"+{km} km ground + border WARNING" if o["border_warnings"]
+                  else f"+{km} km ground + border" if o["border_crossing"] else f"+{km} km ground")
+        flags = (["self-transfer"] if o["self_transfer"] else []) + ([ground] if km else [])
         link = (o["booking_urls"] or ["-"])[0]
         return (f"#{o['rank']} {o['price_eur']:.0f} EUR | {o['route']} | {dep} → {arr} | "
                 f"{o['stops']} stop(s){', ' + ', '.join(flags) if flags else ''} | {o['source']} | {link}")
@@ -314,7 +348,16 @@ async def research_route(origin: str, destination: str, day: str, flex_days: int
                   "flex_days": flex_days, "adults": adults},
         "origin": O.brief(), "destination": D.brief(),
         "origin_alternatives": [{**a.brief(), "km": round(km)} for a, km in o_alts],
-        "destination_alternatives": [{**a.brief(), "km": round(km)} for a, km in d_alts],
+        "destination_alternatives": [{**a.brief(), "km": round(km),
+                                      **({"border_warnings": w} if (w := borders.warnings(ground(a.country))) else {})}
+                                     for a, km in d_alts],
+        # Remembered border closures/restrictions and island legs among the shown options.
+        "border_warnings": list(dict.fromkeys(w for o in options[:10] for w in o["border_warnings"])),
+        **({"unverified_borders": {
+            "borders": sorted(unverified),
+            "hint": "no remembered status for these land borders on the ground legs above: if the answer "
+                    "depends on them, web-search whether they are open and record the finding with the "
+                    "flight-research report_border_status tool (with the source URL)"}} if unverified else {}),
         "hubs": [{**h, "airlines": sorted(h["airlines"]), "serves": sorted(h["serves"]),
                   "daily_flights": round(h["daily_flights"], 1)} for h in top_hubs],
         "options": options[:10], "options_total": len(options),

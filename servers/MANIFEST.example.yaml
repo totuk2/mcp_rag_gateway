@@ -46,6 +46,8 @@ env:                                         # optional, passed to the subproces
 #                             #   (keeps secrets out of this committed manifest)
 # env_file:                   # optional: env file(s) relative to this dir,
 #   - .env                    #   loaded into the container (servers/<id>/.env is gitignored)
+# volumes:                    # optional named volumes `name:/path` (compose volume
+#   - data:/data              #   `<id>-data`): state that survives `up --build`
 
 # ── kind: remote ──  already-running server elsewhere; just register its URL.
 # id: my-remote-server

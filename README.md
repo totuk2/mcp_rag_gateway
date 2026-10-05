@@ -183,6 +183,7 @@ env:                              # optional, set inside the container
   LOG_LEVEL: info                 #   literal
   API_KEY: "${IMAGES_KEY}"        #   interpolated from the root .env at `compose up`
 # env_file: [.env]                # optional env file(s) relative to servers/<id>/
+# volumes: [data:/data]           # optional named volumes (`<id>-data`), survive `up --build`
 ```
 
 > **Server secrets:** put a docker server's secret env in the root `.env` and
@@ -559,7 +560,7 @@ text is fenced and labelled as untrusted data. The `hard-flight-routing` skill a
 | `skiplagged` | remote | Skiplagged: flights, fare calendars, hotels, cars | — |
 | `google-flights` | docker | Google Flights via [fli](https://github.com/punitarani/fli) | — |
 | `flights` | docker | Duffel (NDC) | `DUFFEL_API_KEY_LIVE` |
-| `flight-research` | docker | `nearby_airports` (OurAirports), `airport_routes` / `airport_schedule` (AeroDataBox), `research_route` | `AERODATABOX_KEY` (optional) |
+| `flight-research` | docker | `nearby_airports` (OurAirports), `airport_routes` / `airport_schedule` (AeroDataBox), `research_route`, `report_border_status` / `border_status` | `AERODATABOX_KEY` (optional) |
 
 `research_route(origin, destination, date, …)` expands nearby airports, finds hubs that
 fly into the destination area (AeroDataBox route stats; without a key, from the
@@ -570,6 +571,15 @@ border crossing). It returns a one-line-per-option `summary`, full `options`, `h
 `coverage` (what ran / failed) and `manual_checks` (last-leg airlines no engine priced —
 check their websites). The `hard-flight-routing` skill drives it plus the fallbacks
 (Playwright on airline sites, stopping at CAPTCHAs).
+
+Ground legs use land neighbours from GeoNames (`countryInfo.txt`, plus `land_link`
+rows in `flight_research/overrides.csv` for tunnels/bridges). Legs to or from an island
+state aren't dropped; they're flagged "no road link" for the user to check the ferry.
+Border closures are a **memory**, not a table: agents record what a web search found
+with `report_border_status` (status, source URL, note; latest report wins), stored in
+`/data/cache.db` (the `flight-research-data` volume). `research_route` ranks options
+across a reported closed or restricted border down and lists them in `border_warnings`,
+and names crossed borders with no report in `unverified_borders`.
 
 ### Startup, refresh, and liveness
 

@@ -193,6 +193,16 @@ def provision_docker(
             except ValueError:
                 raise ManifestError(f"{server_dir}: env_file {f!r} must be inside the repo")
         service["env_file"] = resolved
+    if m.get("volumes"):
+        # Named volumes only (`data:/data`), prefixed with the server id so servers
+        # can't collide; they survive `compose up --build` (caches, memories).
+        mounts: list[str] = []
+        for v in m["volumes"]:
+            name, _, target = str(v).partition(":")
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", name) or not target.startswith("/"):
+                raise ManifestError(f"{server_dir}: volume {v!r} must be `name:/absolute/path`")
+            mounts.append(f"{server_id}-{name}:{target}")
+        service["volumes"] = mounts
     if m.get("command"):
         service["command"] = [str(c) for c in m["command"]]
     if host_mode:
@@ -272,8 +282,12 @@ def main() -> None:
     )
     print(f"wrote {GENERATED_REGISTRY.relative_to(ROOT)} ({len(registry_servers)} servers)")
 
+    compose: dict[str, Any] = {"services": compose_services or {}}
+    volumes = {v.split(":")[0] for s in compose_services.values() for v in s.get("volumes", [])}
+    if volumes:
+        compose["volumes"] = {v: {} for v in sorted(volumes)}
     COMPOSE_SERVERS.write_text(
-        GENERATED_HEADER + yaml.safe_dump({"services": compose_services or {}}, sort_keys=True),
+        GENERATED_HEADER + yaml.safe_dump(compose, sort_keys=True),
         encoding="utf-8",
     )
     print(f"wrote {COMPOSE_SERVERS.relative_to(ROOT)} ({len(compose_services)} docker services)")

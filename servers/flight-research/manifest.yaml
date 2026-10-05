@@ -9,7 +9,10 @@ build: .
 port: 8000
 transport: streamable_http
 path: /mcp
-description: "Flight research for hard routes: nearby airports, what flies into an airport (routes, schedules), and multi-engine itinerary search with hub and self-transfer combinations."
+# /data holds the API cache and the border memory (borders.py): keep it across rebuilds.
+volumes:
+  - data:/data
+description: "Flight research for hard routes: nearby airports, what flies into an airport (routes, schedules), and multi-engine itinerary search with hub and self-transfer combinations, plus a shared memory of land-border closures for ground legs."
 categories: [flight-search, aviation-data]
 env:
   AERODATABOX_KEY: "${AERODATABOX_KEY}"
