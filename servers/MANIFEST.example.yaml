@@ -14,6 +14,8 @@
 # Optional, any kind: `stateful: true` if the server keeps state per MCP session (e.g. a
 # browser's open page). The gateway then reuses one upstream session per client session
 # instead of opening a new one per call.
+# `review_changes: true|false` — quarantine new tools / changed descriptions until an admin
+# approves them (GET/POST /tool-rag/reviews). Default: true for URLs outside the LAN.
 # `compact_results: true` for flight-search engines: the gateway rewrites their large search
 # results into a short digest (gateway/compactors.py; run_tool full=true for the raw result).
 

@@ -463,6 +463,51 @@ background (`gateway/jobs.py`). The `get_job_result` meta-tool waits up to ~20 s
 returns the original result, or `running` again. Jobs belong to the API key that started
 them, are kept 30 min after completion (dropped when fetched) and are lost on restart.
 
+### Response projection and result handles
+
+`run_tool` and `run_tools` items accept `fields` — JSON paths such as `"query"`,
+`"itineraries[].price"`, `"items[0].title"` — and return only those parts of a JSON
+result. Whenever the gateway shortens a result (a projection, a compact flight digest, or
+any text over `RESULT_MAX_CHARS`, default 40000), it keeps the full text for
+`RESULT_TTL_S` (30 min) under a `result_id`; `get_result {result_id, fields?, grep?,
+offset?, limit?}` reads it back projected, grepped (regex over lines; JSON is
+pretty-printed first) or in character windows — instead of re-running the call. Results
+belong to the key that produced them and are in memory only (`gateway/results.py`).
+
+### Hot reload (no restarts)
+
+A gateway restart drops every client's MCP session (LibreChat then reports "Connection
+closed" until it reconnects). Instead, every `CONFIG_RELOAD_INTERVAL` seconds (10) the
+gateway re-reads changed `keys.yaml`, `registry*.yaml` and `skills/*/SKILL.md` and applies
+them in place: new keys work immediately; a registry change re-syncs upstreams (adding,
+updating and pruning tools), refreshes the catalog, reindexes and drops sticky sessions of
+changed servers. A file that fails to parse is logged and the previous config stays. Force
+it with `POST /tool-rag/reload` (admin). So: add a server = provision + `docker compose up -d
+--no-deps <server>`; the gateway picks it up by itself.
+
+### Tool reviews (quarantine for external servers)
+
+Upstream tool descriptions go straight into models' context, so a server that changes them
+can inject instructions ("tool poisoning" / "rug pull"). For servers with `review_changes`
+— by default any URL outside the LAN (not a compose name, `*.lan`/`*.local` or private IP;
+set it explicitly in a manifest or `registry.yaml` to override) — the first sync is trusted,
+and afterwards:
+- a **new tool** is quarantined: hidden from search and catalog, calls blocked;
+- a **changed** name/description/input schema keeps the **approved** version in use (what
+  models see) until approved.
+
+`GET /tool-rag/reviews` lists pending changes with the approved and proposed text;
+`POST /tool-rag/reviews/approve` or `/reject` with `{"tool_ids": [...]}` or `{"all": true}`
+(admin only). Rejected changes stay rejected until the upstream changes again; an upstream
+reverting to the approved text clears its review. `/tool-rag/metrics` shows `pending_reviews`.
+
+### Metrics
+
+`GET /tool-rag/metrics/tools` — per tool: calls, errors, avg/p50/p95/max latency, background
+jobs, and for upstream calls the result size before (`raw_chars`) and after shaping
+(`sent_chars`); admin keys also get calls per key. `GET /tool-rag/metrics/prometheus` — the
+same as Prometheus counters (Bearer-authed like the rest of `/tool-rag`).
+
 ### Compact flight-search results
 
 Fare engines return huge payloads (a round-trip search: Kiwi ~54 KB, Google Flights
@@ -645,6 +690,9 @@ export them in your shell instead. All variables are optional — defaults below
 | `TOOL_RAG_AGENT`               | `off`                    | `on` = list the `delegate` sub-agent meta-tool (needs `TOOL_RAG_PLANNER=llm` with a tool-calling model) |
 | `TOOL_RAG_AGENT_TIMEOUT`       | `240`                    | Seconds budget for one `delegate` run |
 | `TOOL_CALL_SYNC_SECS`          | `25`                     | Tool calls slower than this return a `job_id`; fetch with `get_job_result` |
+| `RESULT_MAX_CHARS`             | `40000`                  | Longer tool results are truncated with a `result_id` for `get_result` |
+| `RESULT_TTL_S`                 | `1800`                   | How long stored full results stay readable via `get_result` |
+| `CONFIG_RELOAD_INTERVAL`       | `10`                     | Seconds between hot-reload checks of keys/registry/skills; `0` = off |
 | `COMPACT_MAX_OPTIONS`          | `10`                     | Options kept per compacted flight-search result (`compact_results` servers) |
 | `STICKY_SESSION_IDLE_SECS`     | `600`                    | Close a sticky upstream session (stateful servers) after this idle time |
 | `STICKY_MAX_SESSIONS`          | `20`                     | Max open sticky upstream sessions (least recently used closed first) |
