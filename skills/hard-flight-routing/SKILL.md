@@ -18,16 +18,25 @@ thin routes almost always have *some* way in; your job is to find and compare th
 ## 1. Run the systematic search first
 
 Call `flight-research__research_route` (via `run_tool`) with origin, destination
-(IATA, metro code or English city name — translate e.g. "Mediolan" → "Milan") and
-date (`YYYY-MM-DD`). Defaults are sensible; pass `flex_days` if the user is flexible.
-It takes up to ~75 s. It returns:
+(IATA, metro code, English city name — translate e.g. "Mediolan" → "Milan" — or a
+country = all its scheduled airports) and the user's dates as ONE window: `date` +
+`date_to` ("1–15 November" → 11-01..11-15), or `date` ± `flex_days` (any number).
+Work the window out yourself and make one call per direction — never one call per day.
+It takes up to ~150 s (a background job: poll get_job_result) and searches every origin airport, the hubs into the destination
+(with their nearby airports, e.g. DXB + SHJ) and the hub legs over the whole window.
+It returns:
 
-- `options` — ranked itineraries (price in EUR, route, segments, booking links, notes);
-- `hubs` — airports that actually fly into the destination area;
-- `coverage` — which engine/route queries ran and which failed;
+- `options` — ranked itineraries (price in EUR, estimated ground cost/time in
+  `ground_legs`, route — `~` marks an airport change, e.g. `KRK-SHJ~DXB-KBL` —
+  segments, booking links, notes);
+- `hubs` — hub areas used, with where the evidence came from;
+- `unchecked` — searches that FAILED: report them as "could not be checked", never as
+  "no flights";
+- `coverage` — every engine/route query that ran;
 - `manual_checks` — airlines flying the last leg that no engine priced.
 
-Read `summary` first — one line per ranked option (price, route, times, flags, link).
+Read `summary` first — one line per ranked option (price, route, times, flags, link),
+ranked by value; `CHEAPEST:` lines add the cheapest options when they rank lower.
 Quote prices, routes and links **exactly** from `summary`/`options`; never estimate or
 reconstruct them. If it returns good options, present them (see "Answer format") — you're
 done.
@@ -37,7 +46,8 @@ done.
 1. **What flies in?** `flight-research__airport_routes` for the destination and its
    neighbours (`flight-research__nearby_airports`). The airlines and origin airports
    listed there are the only ways in — build the trip around them.
-2. **Price the legs yourself.** For each promising hub H: search origin→H and H→destination
+2. **Price the legs yourself** (research_route already does this for its top hubs; do it
+   for a hub it didn't use, or a carrier the user named). Search origin→H and H→destination
    separately with `kiwi__search-flight` (supports `allow_self_transfer`,
    `allow_diff_airport_connection`, `departureDateFlexDays`) and
    `google-flights__search_flights` (comma-separated airports allowed). Leave ≥3 h
@@ -97,11 +107,13 @@ airline's own booking page with the Playwright tools (`playwright__browser_navig
 
 ## Answer format
 
-- A table of the best 3–6 options: total price (EUR + original currency), route,
-  dates/times, number of tickets, self-transfer/ground legs, source, booking link.
+- A table of the best 3–6 options sorted by total price (tickets + estimated ground cost,
+  marked as an estimate), always including the cheapest found and the best-value (#1)
+  option: route, dates/times, number of tickets, self-transfer / airport change / ground
+  legs, source, booking link. Separate-ticket connections under 3 h: flag as risky.
 - Clearly mark **separate tickets** (missed connection = your problem) and **ground
   legs / border crossings**.
-- One line on what was searched and what couldn't be checked (from `coverage`).
+- One line on what was searched and what couldn't be checked (from `unchecked`).
 - For destinations with travel advisories or visa requirements (e.g. Syria, Afghanistan,
   Yemen), add a short note to check the official travel advisory and visa rules before
   booking.

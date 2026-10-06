@@ -8,6 +8,8 @@ Everything else is derived from data, not hand-kept tables (each file optional):
 - COUNTRY_NAMES_CSV: country names in every CLDR language (build_data.py).
 - ROUTES_DAT: OpenFlights routes (ODbL); routes per airport = its traffic rank,
   which picks a country's main airport (OurAirports has no traffic data).
+- PRICE_LEVELS_CSV: price level per country relative to the US (World Bank: consumption
+  PPP factor / exchange rate, build_data.py); scales ground-transfer cost estimates.
 - AIRPORT_OVERRIDES: `kind,key,value` rows for what data gets wrong
   (`country_alias,anglia,GB`, `primary,US,JFK`; borders.py reads `land_link`
   and `closed_border`).
@@ -27,6 +29,10 @@ CSV_PATH = os.environ.get("AIRPORTS_CSV", "/app/data/airports.csv")
 COUNTRIES_CSV = os.environ.get("COUNTRIES_CSV", "/app/data/countries.csv")
 COUNTRY_NAMES_CSV = os.environ.get("COUNTRY_NAMES_CSV", "/app/data/country_names.csv")
 ROUTES_DAT = os.environ.get("ROUTES_DAT", "/app/data/routes.dat")
+PRICE_LEVELS_CSV = os.environ.get("PRICE_LEVELS_CSV", "/app/data/price_levels.csv")
+# Max airports a country expands to (busiest first). Covering more airports finds more
+# fares; the cap only matters for big countries (US, CN, …).
+COUNTRY_MAX_AIRPORTS = int(os.environ.get("COUNTRY_MAX_AIRPORTS", "30"))
 OVERRIDES_CSV = os.environ.get("AIRPORT_OVERRIDES", os.path.join(os.path.dirname(__file__), "overrides.csv"))
 # A name word in more than this share of airport names ("airport", "regional",
 # "field") says nothing about which airport is meant.
@@ -60,6 +66,10 @@ _keywords: dict[str, set[str]] = {}
 _countries: dict[str, str] = {}
 # IATA -> number of routes touching it (OpenFlights); 0 when unknown.
 _traffic: dict[str, int] = {}
+# IATA -> {origin IATA: airlines} for routes INTO it (OpenFlights; historical, ~2014).
+_routes_in: dict[str, dict[str, set[str]]] = {}
+# Country ISO code -> price level vs the US (1.0); see PRICE_LEVELS_CSV.
+_price_level: dict[str, float] = {}
 # Country ISO code -> pinned main airport (overrides only; else busiest wins).
 _primary: dict[str, str] = {}
 # Name words too common to identify an airport (computed in load()).
@@ -111,8 +121,18 @@ def load(path: str = CSV_PATH) -> None:
                             _countries.setdefault(_norm(n), row.get("code") or "")
     if os.path.exists(ROUTES_DAT):
         with open(ROUTES_DAT, encoding="utf-8") as f:
-            routes = {(r[2], r[4]) for r in csv.reader(f) if len(r) > 4}
+            rows = [r for r in csv.reader(f) if len(r) > 4]
+        routes = {(r[2], r[4]) for r in rows}
         _traffic.update(Counter(code for route in routes for code in route))
+        for r in rows:
+            _routes_in.setdefault(r[4], {}).setdefault(r[2], set()).add(r[0])
+    if os.path.exists(PRICE_LEVELS_CSV):
+        with open(PRICE_LEVELS_CSV, encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                try:
+                    _price_level[row["code"]] = float(row["level"])
+                except (KeyError, ValueError):
+                    pass
     for key, value in override_rows("country_alias"):
         _countries[_norm(key)] = value.upper()
     for key, value in override_rows("primary"):
@@ -164,16 +184,33 @@ def country_code(location: str) -> str | None:
     return loc.upper() if re.fullmatch(r"[A-Za-z]{2}", loc) else _countries.get(_norm(loc))
 
 
-def country_airports(location: str, limit: int = 12) -> list[Airport]:
-    """The main scheduled airports of a country given by name ("Poland", "Polska")
-    or ISO code ("PL"); [] if `location` isn't a country. Busiest first — the
-    first one is what single-airport engines use."""
+def country_airports(location: str, limit: int | None = None) -> list[Airport]:
+    """All scheduled-service airports of a country given by name ("Poland", "Polska")
+    or ISO code ("PL"), busiest first, at most COUNTRY_MAX_AIRPORTS; [] if `location`
+    isn't a country. The first one is what single-airport engines use. Small airports
+    count only when route data shows traffic (OurAirports flags some airstrips)."""
     code = country_code(location)
     if not code:
         return []
-    aps = [a for a in _all if a.country == code and a.scheduled and a.type != "small_airport"]
+    aps = [a for a in _all if a.country == code and a.scheduled
+           and (a.type != "small_airport" or _traffic.get(a.iata, 0) > 0)]
     # Traffic before type: OurAirports calls e.g. every Polish airport "large".
-    return sorted(aps, key=lambda a: (a.iata != _primary.get(code), -_traffic.get(a.iata, 0), *_rank(a)))[:limit]
+    return sorted(aps, key=lambda a: (a.iata != _primary.get(code), -_traffic.get(a.iata, 0), *_rank(a)))[:limit or COUNTRY_MAX_AIRPORTS]
+
+
+def routes_into(iata: str) -> dict[str, set[str]]:
+    """Airports with a (historical, OpenFlights) route into `iata` -> their airlines."""
+    load()
+    return _routes_in.get((iata or "").upper(), {})
+
+
+def price_level(country: str) -> float:
+    """Price level vs the US (1.0); the median of known countries when unknown."""
+    load()
+    if country in _price_level:
+        return _price_level[country]
+    vals = sorted(_price_level.values())
+    return vals[len(vals) // 2] if vals else 0.6
 
 
 def code_for_name(name: str) -> str:

@@ -457,7 +457,7 @@ no stickiness.
 ### Long calls: background jobs
 
 MCP clients give up on a tool call after a fixed time (LibreChat: `timeout`, default
-30 s), while `research_route` takes up to ~75 s and `delegate` minutes. Every tool call
+30 s), while `research_route` takes up to ~150 s and `delegate` minutes. Every tool call
 therefore answers within `TOOL_CALL_SYNC_SECS` (default 25): with the result if done,
 otherwise with `{"status": "running", "job_id": …}` while the call keeps running in the
 background (`gateway/jobs.py`). The `get_job_result` meta-tool waits up to ~20 s and
@@ -562,15 +562,29 @@ text is fenced and labelled as untrusted data. The `hard-flight-routing` skill a
 | `flights` | docker | Duffel (NDC) | `DUFFEL_API_KEY_LIVE` |
 | `flight-research` | docker | `nearby_airports` (OurAirports), `airport_routes` / `airport_schedule` (AeroDataBox), `research_route`, `report_border_status` / `border_status` | `AERODATABOX_KEY` (optional) |
 
-`research_route(origin, destination, date, …)` expands nearby airports, finds hubs that
-fly into the destination area (AeroDataBox route stats; without a key, from the
-engines' connection airports), queries all engines for the whole trip and for
-origin→hub / hub→destination legs in parallel (~20-75 s budget), combines self-transfer
-legs (≥3 h), and ranks by price + time + risk (self-transfer, stops, ground distance,
-border crossing). It returns a one-line-per-option `summary`, full `options`, `hubs`,
-`coverage` (what ran / failed) and `manual_checks` (last-leg airlines no engine priced —
-check their websites). The `hard-flight-routing` skill drives it plus the fallbacks
-(Playwright on airline sites, stopping at CAPTCHAs).
+`research_route(origin, destination, date, date_to | flex_days, …)` searches one date
+window in one call (`date`..`date_to`, or `date` ± `flex_days`; ≤ 45 days): the calling
+agent turns the user's wording into the window, so there's no per-day calling and no
+extra LLM call. A country as origin/destination means all its scheduled airports
+(OurAirports, busiest first, `COUNTRY_MAX_AIRPORTS` = 30); Kiwi gets them in small groups
+(`RESEARCH_KIWI_CHUNK` = 4; one Kiwi query returns only ~15 itineraries, so a long origin
+list hides cheaper fares). Hubs into the destination come from AeroDataBox route stats
+(current, optional key), OpenFlights routes (historical) and the engines' own connections;
+each hub is an *area* with the scheduled airports within `RESEARCH_METRO_RADIUS_KM` (80),
+found by distance (DXB + SHJ, IST + SAW). Origin→area and area→destination legs over the
+window are combined into self-transfer options (≥3 h; changing airports adds the ground
+transfer's time). Ground legs (airport change, landing next to the destination) carry an
+estimated time and cost (`flight_research/ground.py`: road km from distance, taxi then
+bus rate, scaled by the country's World Bank price level — `price_levels.csv`, built in
+the image; tunable via `GROUND_*` env). Ranking = price + estimated ground cost + time +
+risk; the `summary` adds `CHEAPEST:` lines when the cheapest options rank lower.
+Engine calls are capped per engine (`ENGINE_CONCURRENCY` = 3) and retried with back-off on
+429/5xx/connection errors (`ENGINE_RETRIES` = 3); the whole call has a `RESEARCH_BUDGET_S`
+(150 s) deadline with hub→destination legs queued first. Failed or cut-off searches are
+listed in `unchecked` (agents must say "not checked", never "no flights"); also returned:
+full `options`, `hubs` (with their evidence sources), `coverage` and `manual_checks`
+(last-leg airlines no engine priced — check their websites). The `hard-flight-routing`
+skill drives it plus the fallbacks (Playwright on airline sites, stopping at CAPTCHAs).
 
 Ground legs use land neighbours from GeoNames (`countryInfo.txt`, plus `land_link`
 rows in `flight_research/overrides.csv` for tunnels/bridges). Legs to or from an island

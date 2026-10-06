@@ -580,6 +580,21 @@ def _save_site_recipe_definition() -> types.Tool:
     )
 
 
+def _root_cause(e: BaseException) -> BaseException:
+    """First leaf of anyio TaskGroup exception groups — the real upstream error."""
+    while isinstance(e, BaseExceptionGroup) and e.exceptions:
+        e = e.exceptions[0]
+    return e
+
+
+def _not_executed(e: BaseException) -> bool:
+    """Errors that mean the upstream never ran the call, so retrying can't repeat a side effect."""
+    import httpx
+    if isinstance(e, httpx.HTTPStatusError):
+        return e.response.status_code in (429, 502, 503, 504)
+    return isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout))
+
+
 def build_gateway_server(
     registry: Registry,
     retriever: "Retriever | None" = None,
@@ -1103,16 +1118,25 @@ def build_gateway_server(
             except LookupError:
                 downstream = None
         t0 = time.monotonic()
-        try:
-            if downstream is not None:
-                res = await session_pool.call_tool(downstream, cfg, orig, arguments)
-            else:
-                async with open_upstream_session(cfg) as us:
-                    res = await us.call_tool(orig, arguments)
-        except Exception as e:
-            logger.exception("call_tool upstream error")
-            metrics.record(name, "upstream", False, (time.monotonic() - t0) * 1000)
-            return _err_tool(f"Upstream error: {e}")
+        for attempt in (1, 2):
+            try:
+                if downstream is not None:
+                    res = await session_pool.call_tool(downstream, cfg, orig, arguments)
+                else:
+                    async with open_upstream_session(cfg) as us:
+                        res = await us.call_tool(orig, arguments)
+                break
+            except Exception as e:
+                cause = _root_cause(e)
+                # The pool retries on its own; elsewhere retry once when the upstream
+                # certainly didn't run the call (overloaded / unreachable).
+                if attempt == 1 and downstream is None and _not_executed(cause):
+                    logger.warning("call_tool %s: %s; retrying once", name, cause)
+                    await asyncio.sleep(1.5)
+                    continue
+                logger.exception("call_tool upstream error")
+                metrics.record(name, "upstream", False, (time.monotonic() - t0) * 1000)
+                return _err_tool(f"Upstream error: {type(cause).__name__}: {cause}")
         raw = sum(len(c.text) for c in res.content if isinstance(c, types.TextContent))
         res = _shape_result(name, orig, cfg, arguments, res, full, fields)
         sent = sum(len(c.text) for c in res.content if isinstance(c, types.TextContent))

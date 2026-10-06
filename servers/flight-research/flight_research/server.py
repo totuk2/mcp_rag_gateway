@@ -89,20 +89,28 @@ async def research_route(origin: str, destination: str, date: str, flex_days: in
                          max_price_eur: float | None = None, dest_radius_km: float = 400,
                          origin_radius_km: float = 200, allow_ground: bool = True,
                          date_to: str | None = None) -> str:
-    """Systematic flight research for hard routes, in one call (~30-75 s).
-    Expands nearby airports around origin and destination, finds hubs that actually
-    fly into the destination area, queries Kiwi.com, Google Flights, Skiplagged and
-    Duffel for the whole trip and for origin→hub / hub→destination legs, combines
-    self-transfer options, and ranks them by price, time and risk.
-    Returns `options` (ranked, with segments and booking links), `hubs`, `coverage`
-    (what was searched / failed) and `manual_checks` (airlines on the last leg that no
-    engine priced — check their websites). For a flexible window (e.g. "any day in
-    December") pass `date` = first day and `date_to` = last day: the whole-trip search
-    covers every day in the range in ONE call — prefer this over many calls with
-    different dates. `origin`/`destination` may be a country ("Poland", "PL") = any of
-    its main airports; otherwise an IATA/metro code or
-    city name in English or local spelling;
-    `date`: YYYY-MM-DD.
+    """Systematic flight research for hard routes, in one call (~30-150 s; runs on as a background job).
+    DATES — one call covers the whole window, every engine and leg searches it:
+    `date` (YYYY-MM-DD) + `date_to` = an explicit window ("1-15 November" -> date
+    2026-11-01, date_to 2026-11-15; "any day in December" -> 12-01..12-31); without
+    `date_to`, the window is `date` ± `flex_days` (any number, e.g. 7 for "around the
+    10th, a week either way"). Translate the user's wording into ONE window yourself;
+    never call this repeatedly for different days of the same range (max 45 days).
+    `origin`/`destination`: a country ("Poland", "PL") = ALL its scheduled airports;
+    otherwise an IATA/metro code or city name in English or local spelling (nearby
+    airports are added).
+    What it does: whole-trip searches (Kiwi.com over the window, Google Flights'
+    cheapest days, then Google / Skiplagged / Duffel on those days); hubs that fly into
+    the destination (current route stats, historical routes and the engines' own
+    connections), each with its nearby airports (e.g. DXB + SHJ); origin→hub and
+    hub→destination legs combined into self-transfer options, including changing
+    airports within a hub area (estimated ground time and cost added). Ranked by
+    price + estimated ground cost + time + risk; `summary` lists the top options one
+    per line, plus CHEAPEST lines when the cheapest isn't in the top 10 — read it first.
+    Also returns `options` (segments, booking links, ground_legs with estimated km /
+    hours / cost), `hubs`, `coverage`, `unchecked` (searches that FAILED — report them
+    as not checked, never as "no flights") and `manual_checks` (last-leg airlines no
+    engine priced — check their websites).
     Ground legs: `border_warnings` lists remembered border closures and island legs
     (no road link: tell the user to double-check the ferry/connection);
     `unverified_borders` lists crossed borders with no remembered status — web-search

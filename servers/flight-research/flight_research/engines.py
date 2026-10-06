@@ -14,9 +14,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import re
 import time
 from datetime import date as Date
+
+import logging
 
 import httpx
 from mcp.client.session import ClientSession
@@ -37,10 +40,34 @@ ENGINE_TIMEOUT = float(os.environ.get("ENGINE_TIMEOUT", "45"))
 CACHE_TTL_S = float(os.environ.get("ENGINE_CACHE_TTL", "900"))
 _cache: dict[str, tuple[float, str]] = {}
 _inflight: dict[str, asyncio.Future] = {}
+# Hosted engines answer 503 when hit by many sessions at once (Kiwi): cap concurrent
+# calls per engine URL and retry transient failures with back-off.
+ENGINE_CONCURRENCY = int(os.environ.get("ENGINE_CONCURRENCY", "3"))
+RETRIES = int(os.environ.get("ENGINE_RETRIES", "3"))
+RETRY_BACKOFF_S = float(os.environ.get("ENGINE_RETRY_BACKOFF_S", "2"))
+_sems: dict[tuple[int, str], asyncio.Semaphore] = {}
+
+
+log = logging.getLogger(__name__)
 
 
 class EngineError(RuntimeError):
     pass
+
+
+def root_cause(e: BaseException) -> BaseException:
+    """First leaf of anyio TaskGroup exception groups (the real error)."""
+    while isinstance(e, BaseExceptionGroup) and e.exceptions:
+        e = e.exceptions[0]
+    return e
+
+
+def _transient(e: BaseException) -> bool:
+    e = root_cause(e)
+    if isinstance(e, httpx.HTTPStatusError):
+        return e.response.status_code in (429, 500, 502, 503, 504)
+    import anyio
+    return isinstance(e, (httpx.TransportError, anyio.BrokenResourceError, anyio.ClosedResourceError))
 
 
 async def call_mcp(url: str, tool: str, args: dict) -> str:
@@ -54,7 +81,20 @@ async def call_mcp(url: str, tool: str, args: dict) -> str:
     fut = asyncio.get_running_loop().create_future()
     _inflight[key] = fut
     try:
-        text = await _call_mcp(url, tool, args)
+        sem = _sems.setdefault((id(asyncio.get_running_loop()), url), asyncio.Semaphore(ENGINE_CONCURRENCY))
+        # The slot is held through the back-off: an overloaded engine gets less traffic,
+        # and a retried call keeps its place instead of queueing behind everything.
+        async with sem:
+            for attempt in range(RETRIES + 1):
+                try:
+                    text = await _call_mcp(url, tool, args)
+                    break
+                except Exception as e:
+                    if attempt >= RETRIES or not _transient(e):
+                        raise
+                    log.info("%s %s: %s; retry %d", url, tool, type(root_cause(e)).__name__, attempt + 1)
+                    # Jitter: parallel calls that failed together must not retry together.
+                    await asyncio.sleep(RETRY_BACKOFF_S * (2 ** attempt) * (0.5 + random.random()))
     except BaseException as e:
         if not fut.done():
             fut.set_exception(e)
@@ -147,6 +187,26 @@ async def google(origins: list[str], destinations: list[str], day: str, adults: 
         out.append({"source": "google", "price": f.get("price"), "currency": f.get("currency"),
                     "booking_url": url, "segments": segs, "self_transfer": None, "notes": []})
     return out
+
+
+async def google_dates(origins: list[str], destinations: list[str], day: str, day_to: str,
+                       adults: int = 1) -> list[tuple[str, float, str]]:
+    """Cheapest one-way fare per departure day in [day, day_to]: [(YYYY-MM-DD, price, currency)],
+    cheapest first. Used to pick which days to search in detail."""
+    text = await call_mcp(URLS["google"], "search_dates", {
+        "origin": ",".join(origins), "destination": ",".join(destinations), "start_date": day,
+        "end_date": day_to, "is_round_trip": False, "passengers": adults,
+    })
+    data = json.loads(text)
+    if not data.get("success", True):
+        raise EngineError(f"google dates: {str(data)[:200]}")
+    out = []
+    for d in data.get("dates") or []:
+        dd = d.get("date")
+        dd = (dd[0] if isinstance(dd, list) and dd else dd) or ""
+        if d.get("price") is not None and dd:
+            out.append((dd[:10], float(d["price"]), d.get("currency") or "EUR"))
+    return sorted(out, key=lambda x: (x[1], x[0]))
 
 
 # ---------------------------------------------------------------- Skiplagged
