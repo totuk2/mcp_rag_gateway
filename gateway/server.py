@@ -588,10 +588,12 @@ def _root_cause(e: BaseException) -> BaseException:
 
 
 def _not_executed(e: BaseException) -> bool:
-    """Errors that mean the upstream never ran the call, so retrying can't repeat a side effect."""
+    """Errors that mean the upstream never ran the call, so retrying can't repeat a side effect.
+    Not 502/504: a proxy returns those after forwarding the request, when the upstream may
+    still be running it (a write tool would then run twice)."""
     import httpx
     if isinstance(e, httpx.HTTPStatusError):
-        return e.response.status_code in (429, 502, 503, 504)
+        return e.response.status_code in (429, 503)
     return isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout))
 
 
